@@ -235,6 +235,7 @@ def run_inference(
     max_num_batched_tokens=None,
     data_parallel_size=1,
     block_size=64,
+    enable_prefix_caching=False,
 ):
     if multi_modal:
         supported_models = [
@@ -262,6 +263,7 @@ def run_inference(
         "num_scheduler_steps": num_scheduler_steps,
         "disable_async_output_proc": disable_async_output_proc,
         "data_parallel_size": data_parallel_size,
+        "enable_prefix_caching": enable_prefix_caching,
     }
 
     try:
@@ -641,6 +643,12 @@ if __name__ == "__main__":
         default=64,
         help="KV cache block size",
     )
+    parser.add_argument(
+        "--enable_prefix_caching",
+        action="store_true",
+        help="Enable prefix caching \
+(use with --prompts_json tt_metal/prompts_overlapping.json to test the feature)",
+    )
 
     args = parser.parse_args()
 
@@ -665,4 +673,5 @@ if __name__ == "__main__":
         max_num_batched_tokens=args.max_num_batched_tokens,
         data_parallel_size=args.data_parallel_size,
         block_size=args.block_size,
+        enable_prefix_caching=args.enable_prefix_caching,
     )

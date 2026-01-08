@@ -143,8 +143,6 @@ class TTPlatform(Platform):
                 == 1), "TT backend does not support distributed execution"
         assert not vllm_config.lora_config, (
             "LoRA is not supported for TT backend")
-        assert not vllm_config.cache_config.enable_prefix_caching, (
-            "Automatic prefix caching is not yet supported for TT backend")
 
         # Import and register models from tt-metal
         override_tt_config = vllm_config.model_config.override_tt_config
@@ -230,10 +228,10 @@ class TTPlatform(Platform):
         # must perform local import to get around circular import
         from vllm.model_executor.model_loader.utils import (
             get_model_architecture)
+        model_class, _ = get_model_architecture(vllm_config.model_config)
 
         # infer if non-greedy decoding is supported on-device
         # based on model implementation, and update platform
-        model_class, _ = get_model_architecture(vllm_config.model_config)
         # TODO: this should come from the class itself as an attribute
         cls.non_greedy_decoding_on_device = False  # type: ignore[attr-defined]
         if model_class.__module__.startswith(
@@ -243,6 +241,43 @@ class TTPlatform(Platform):
         if model_class.__module__.startswith(
                 "models.tt_transformers.tt.generator_vllm"):
             cls.non_greedy_decoding_on_device = True  # type: ignore[attr-defined]
+
+        if (vllm_config.cache_config.enable_prefix_caching
+                and not envs.VLLM_USE_V1):
+            vllm_config.cache_config.enable_prefix_caching = False
+            logger.warning(
+                "Prefix caching is not supported for V0 TT backend, "
+                "disabling it")
+
+        # Get model capabilities from the class
+        model_capabilities: Optional[dict] = getattr(model_class,
+                                                     "model_capabilities",
+                                                     None)
+
+        if vllm_config.cache_config.enable_prefix_caching:
+            # Check prefix caching support from capabilities (default to False)
+            supports_prefix_caching = (model_capabilities.get(
+                "supports_prefix_caching", False)
+                                       if model_capabilities else False)
+
+            if not supports_prefix_caching:
+                vllm_config.cache_config.enable_prefix_caching = False
+                logger.warning(
+                    "Prefix caching is not supported in TT backend for %s, "
+                    "disabling it", model_class.__module__)
+            else:
+                # Check if the model architecture uses sliding window
+                uses_sliding_window = (
+                    vllm_config.model_config.get_sliding_window() is not None)
+                if uses_sliding_window:
+                    vllm_config.cache_config.enable_prefix_caching = False
+                    logger.warning(
+                        "Prefix caching is not supported in TT backend for "
+                        "models with sliding window, disabling it")
+
+        logger.info(
+            "Automatic prefix caching is ", "enabled"
+            if vllm_config.cache_config.enable_prefix_caching else "disabled")
 
     @classmethod
     def supports_v1(cls, model_config: ModelConfig) -> bool:

@@ -182,9 +182,9 @@ class TTModelRunner:
                                                       num_layers)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
-        """Update the cached states and the persistent batch with the 
+        """Update the cached states and the persistent batch with the
         scheduler output.
-        The updated states are used in `_prepare_model_inputs` to create the 
+        The updated states are used in `_prepare_model_inputs` to create the
         input tensors for the model.
         Based on _update_states for GPU/TPU backends.
         """
@@ -399,7 +399,9 @@ class TTModelRunner:
                 len(scheduler_output.scheduled_cached_reqs.req_ids) == 0
             ), "Currently only supporting all prefills or all decodes in batch"
 
-            input_positions = 0
+            # num_computed_tokens for each request is the input position
+            # (=computed previously and cached)
+            input_positions = input_batch.num_computed_tokens_cpu[:num_reqs]
             max_prompt_tokens = max(input_batch.num_prompt_tokens[:num_reqs])
             input_tokens = input_batch.token_ids_cpu_tensor[:num_reqs, :
                                                             max_prompt_tokens]
@@ -503,7 +505,7 @@ class TTModelRunner:
         Update internal state with the scheduler output and build
         TTModelInput without executing the model.
         Returns None if there is no scheduled work in this step.
-        
+
         For data parallel, this function is called by each DP rank to build
         TTModelInput from it's own scheduler output.
         """
@@ -613,7 +615,8 @@ class TTModelRunner:
 
         input_tokens_list: list[torch.Tensor] = []
         block_tables_list: list[torch.Tensor] = []
-        input_positions_list: list[torch.Tensor] = []  # (decode only)
+        input_positions_list: list[torch.Tensor] = [
+        ]  # (position for decode, prefix cache for prefill)
         prompt_lens_list: list[np.ndarray] = []  # (prefill only)
         batch_size_per_dp: list[int] = []
         sampling_params_per_dp: list[Optional[TTSamplingParams]] = []
@@ -720,6 +723,7 @@ class TTModelRunner:
                     input_tokens_list.append(toks)
                     prompt_lens_list.append(mi.prompt_lens)
                     block_tables_list.append(pad_block_tables(mi.block_tables))
+                    input_positions_list.append(mi.input_positions)
 
                 # We know it's not a list here before concatenation
                 unpadded_batch_size: int = cast(
@@ -730,7 +734,7 @@ class TTModelRunner:
                 grammar_bitmask_list.append(
                     mi.grammar_bitmask[0] if mi else None)
 
-            input_positions = 0
+            input_positions = np.concatenate(input_positions_list, axis=0)
             prompt_lens = np.concatenate(prompt_lens_list, axis=0)
 
         input_tokens = torch.cat(input_tokens_list, dim=0)
@@ -828,8 +832,8 @@ class TTModelRunner:
                     for i in range(int(sz)):
                         empty_slots.append(dp_rank * stride + i)
                 kwargs["empty_slots"] = empty_slots
-        else:
-            kwargs["start_pos"] = model_input.input_positions
+
+        kwargs["start_pos"] = model_input.input_positions
         if self.sample_on_device_mode == "all" or (
                 self.sample_on_device_mode == "decode_only" and is_decode):
             # Check that sampling params are the same for all DP ranks.
