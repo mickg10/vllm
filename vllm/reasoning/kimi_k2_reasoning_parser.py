@@ -2,15 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 from transformers import PreTrainedTokenizerBase
 
-from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionRequest,
-)
-from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
+
+if TYPE_CHECKING:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+    from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+    from vllm.entrypoints.openai.responses.protocol import (
+        ResponsesRequest,
+    )
+else:
+    ChatCompletionRequest = Any
+    DeltaMessage = Any
+    ResponsesRequest = Any
 
 
 class KimiK2ReasoningParser(ReasoningParser):
@@ -39,6 +49,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         thinking = bool(chat_kwargs.get("thinking", True))
 
         # If thinking is not enabled, use identity parser to fall through
+        self._identity_parser: IdentityReasoningParser | None
         if not thinking:
             self._identity_parser = IdentityReasoningParser(tokenizer, *args, **kwargs)
         else:
@@ -75,6 +86,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         2. The tool section start token (<|tool_calls_section_begin|>)
         """
         if self._is_identity_mode():
+            assert self._identity_parser is not None
             return self._identity_parser.is_reasoning_end(input_ids)
 
         start_token_id = self._start_token_id
@@ -101,6 +113,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         Check if the reasoning content ends in the input_ids on a decode step.
         """
         if self._is_identity_mode():
+            assert self._identity_parser is not None
             return self._identity_parser.is_reasoning_end_streaming(
                 input_ids, delta_ids
             )
@@ -118,6 +131,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         Extract content token ids from the input_ids.
         """
         if self._is_identity_mode():
+            assert self._identity_parser is not None
             return self._identity_parser.extract_content_ids(input_ids)
 
         if self._end_token_id in input_ids:
@@ -145,13 +159,16 @@ class KimiK2ReasoningParser(ReasoningParser):
         return []
 
     def extract_reasoning(
-        self, model_output: str, request: ChatCompletionRequest
+        self, model_output: str, request: ChatCompletionRequest | ResponsesRequest
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning content from the model output.
         """
         if self._is_identity_mode():
-            return self._identity_parser.extract_reasoning(model_output, request)
+            assert self._identity_parser is not None
+            return self._identity_parser.extract_reasoning(
+                model_output, request  # type: ignore[arg-type]
+            )
 
         # thinking does not require a think start token but consume it if present
         start_token_index = model_output.find(self._start_token)
@@ -190,6 +207,7 @@ class KimiK2ReasoningParser(ReasoningParser):
         Extract reasoning content from a delta message during streaming.
         """
         if self._is_identity_mode():
+            assert self._identity_parser is not None
             return self._identity_parser.extract_reasoning_streaming(
                 previous_text,
                 current_text,
