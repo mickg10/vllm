@@ -95,6 +95,12 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.deepseek_v3.tt.generator_vllm:DeepseekV3ForCausalLM",
     )
 
+    # GLM-4.7-Flash (glm4_moe_lite)
+    ModelRegistry.register_model(
+        "TTGlm4MoeLiteForCausalLM",
+        "models.demos.glm4_moe_lite.tt.generator_vllm:Glm4MoeLiteForCausalLM",
+    )
+
     # GPT-OSS
     ModelRegistry.register_model(
         "TTGptOssForCausalLM",

@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -182,6 +183,14 @@ class OpenAIServingChat(OpenAIServing):
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
+            # GLM-4.x chat templates default to emitting <think> unless the
+            # caller passes {"enable_thinking": False} via chat_template_kwargs.
+            # Most UI clients don't set this, so allow a server-side default.
+            chat_template_kwargs = request.chat_template_kwargs
+            if os.environ.get("GLM_DEFAULT_DISABLE_THINKING", "0") == "1":
+                chat_template_kwargs = dict(chat_template_kwargs or {})
+                chat_template_kwargs.setdefault("enable_thinking", False)
+
             (
                 conversation,
                 request_prompts,
@@ -196,7 +205,7 @@ class OpenAIServingChat(OpenAIServing):
                 continue_final_message=request.continue_final_message,
                 tool_dicts=tool_dicts,
                 documents=request.documents,
-                chat_template_kwargs=request.chat_template_kwargs,
+                chat_template_kwargs=chat_template_kwargs,
                 tool_parser=tool_parser,
                 truncate_prompt_tokens=request.truncate_prompt_tokens,
                 add_special_tokens=request.add_special_tokens,

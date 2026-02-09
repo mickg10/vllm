@@ -273,6 +273,12 @@ def top_pk_logits_efficient(logits,
 
 
 def sample_tokens(logits, tt_sampling_params: TTSamplingParams):
+    # TT models commonly produce a singleton sequence axis (e.g. [B, 1, V]).
+    # Host-side sampling expects [B, V].
+    while logits.ndim > 2 and logits.shape[1] == 1:
+        logits = logits.squeeze(1)
+    if logits.ndim != 2:
+        raise ValueError(f"sample_tokens expected logits [B,V], got shape={tuple(logits.shape)}")
     if tt_sampling_params.temperature == 0:  # greedy decoding
         return torch.argmax(logits, dim=-1)
     else:  # top-k top-p sampling

@@ -430,8 +430,14 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     is_wormhole = "wormhole_b0" in ttnn.get_arch_name()
     devices_per_dp_cache = (device_config.num_devices // data_parallel)
 
-    if ("Llama-3.1-8B" in model_config.model and devices_per_dp_cache == 1
-            and is_wormhole):
+    # Allow manual override of KV cache sizing. This is intentionally a
+    # *total tokens across all users* budget, not per-user.
+    override_tt_config = model_config.override_tt_config or {}
+    kv_tokens_override_key = "kv_cache_max_tokens_all_users"
+    if kv_tokens_override_key in override_tt_config:
+        max_tokens_all_users = int(override_tt_config[kv_tokens_override_key])
+    elif ("Llama-3.1-8B" in model_config.model and devices_per_dp_cache == 1
+          and is_wormhole):
         # Llama8B on N150
         max_tokens_all_users = 32768
     elif ("Qwen3-8B" in model_config.model and devices_per_dp_cache == 1
@@ -459,6 +465,17 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         max_tokens_all_users = 65536
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
+    elif (getattr(model_config, "hf_config", None) is not None
+          and getattr(model_config.hf_config, "model_type", None)
+          in ("glm4_moe_lite", "glm4_moe_lite_mtp", "glm4_moe_mtp")):
+        # GLM-4.7-Flash / glm4_moe_lite uses MLA KVPE caching and is DRAM
+        # heavy (weights + KV). Allocating KV for `max_model_len * max_batch`
+        # can starve activation/intermediate buffers and crash with OOM.
+        #
+        # Default to a single full-length session worth of KV budget. If you
+        # need larger concurrency, increase scheduler max_num_seqs carefully
+        # and/or set `override_tt_config.kv_cache_max_tokens_all_users`.
+        max_tokens_all_users = int(model_config.max_model_len or 32768)
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072

@@ -14,7 +14,9 @@ from vllm.reasoning import ReasoningParser, ReasoningParserManager
 logger = init_logger(__name__)
 
 
-@ReasoningParserManager.register_module("glm4_moe")
+# The GLM model card recommends `--reasoning-parser glm45`. Keep backwards
+# compatibility with the existing `glm4_moe` name.
+@ReasoningParserManager.register_module(["glm4_moe", "glm45"])
 class Glm4MoeModelReasoningParser(ReasoningParser):
     """
     Reasoning parser for the Glm4MoeModel model.

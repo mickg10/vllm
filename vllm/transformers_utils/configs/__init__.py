@@ -8,6 +8,7 @@ from vllm.transformers_utils.configs.deepseek_vl2 import DeepseekVLV2Config
 from vllm.transformers_utils.configs.eagle import EAGLEConfig
 from vllm.transformers_utils.configs.exaone import ExaoneConfig
 from vllm.transformers_utils.configs.exaone4 import Exaone4Config
+from vllm.transformers_utils.configs.glm4_moe_lite import Glm4MoeLiteConfig
 # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
 # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
 # `FalconConfig` class from the official HuggingFace transformers library.
@@ -42,6 +43,7 @@ __all__ = [
     "EAGLEConfig",
     "ExaoneConfig",
     "Exaone4Config",
+    "Glm4MoeLiteConfig",
     "MiniMaxText01Config",
     "MiniMaxVL01Config",
     "MllamaConfig",
