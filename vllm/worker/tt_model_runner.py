@@ -30,6 +30,10 @@ from vllm.worker.model_runner_base import ModelRunnerBase, ModelRunnerInputBase
 
 logger = init_logger(__name__)
 
+# Debug knob used by GLM bring-up. This is intentionally model-scoped so we
+# don't spam logs for other TT models.
+_GLM_DEBUG_PAGE_TABLE_BOUNDARY_ENV = "GLM4_MOE_LITE_DEBUG_PAGE_TABLE_BOUNDARY"
+
 # Padding default values for sampling parameters in decode mode
 # These values ensure greedy/deterministic behavior for padded positions
 PADDING_TEMPERATURE = 0.0  # Greedy sampling (argmax)
@@ -73,7 +77,11 @@ def create_warmup_decode_input_parameters(
     max_batch_size = max_batch_size * data_parallel_size
     tokens = torch.zeros(max_batch_size, 1, dtype=torch.int32)
     start_pos = torch.zeros(max_batch_size, dtype=torch.int32)
-    page_table = torch.zeros(max_batch_size, num_gpu_blocks, dtype=torch.int32)
+    # Padded/unused entries in the page table must be invalid; 0 is a valid
+    # physical KV block id and will corrupt attention if interpreted as such.
+    page_table = torch.full((max_batch_size, num_gpu_blocks),
+                            -1,
+                            dtype=torch.int32)
     sampling_params = create_sampling_params(sample_on_device_mode,
                                              max_batch_size)
     return tokens, start_pos, page_table, sampling_params
@@ -160,7 +168,10 @@ def decode_warmup(model,
         "page_table": page_table,
         "kv_cache": kv_cache,
         "enable_trace": trace_decode_mode,
-        "read_from_device": True,
+        # NOTE: When trace capture is enabled, reading from device is not
+        # supported and will raise a TT_FATAL. Warmup does not need the
+        # produced token IDs, only compilation/trace capture.
+        "read_from_device": not trace_decode_mode,
         "sampling_params": None,  #to be filled
     }
 
@@ -308,6 +319,13 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         assert self.scheduler_config.chunked_prefill_enabled is False
 
         self.block_size = self.cache_config.block_size
+        # Page table width is max logical blocks per request, not total physical
+        # KV blocks in the cache. Using `num_gpu_blocks` (physical) can produce
+        # non-power-of-2 widths (e.g., 518) that some paged kernels are sensitive
+        # to, especially under tracing.
+        self.max_blocks_per_seq = (
+            int(self.scheduler_config.max_model_len) + int(self.block_size) - 1
+        ) // int(self.block_size)
 
         # whether to use ttnn tracing for model execution
         self.trace_mode = trace_mode
@@ -323,7 +341,16 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # If sampling on device and in decode, delay reading the token
         # until after we start executing the next step on device.
-        self.async_read_decode = True
+        # This is a performance optimization, but it must be correct.
+        # For model bring-up/debugging, allow forcing synchronous reads to
+        # eliminate event-ordering issues as a source of nondeterminism.
+        self.async_read_decode = os.environ.get("TT_ASYNC_READ_DECODE",
+                                                "1").strip().lower() not in {
+                                                    "0",
+                                                    "false",
+                                                    "no",
+                                                    "off",
+                                                }
 
         self.cached_step_outputs: List[torch.Tensor] = [
         ]  # Only used for multi-step execution
@@ -588,6 +615,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
             block_table = seq_group_metadata.block_tables[seq_id]
             block_tables_list.append(block_table)
+            if (not is_prompt and os.environ.get(
+                    _GLM_DEBUG_PAGE_TABLE_BOUNDARY_ENV,
+                    "").strip() == "1"):
+                try:
+                    if 58 <= int(position) <= 70:
+                        logger.info(
+                            "GLM boundary debug (prepare_model_input): "
+                            "seq_id=%s pos=%s seq_len=%s block_table_len=%s "
+                            "block_table_head=%s",
+                            seq_id,
+                            position,
+                            seq_data.get_len(),
+                            len(block_table),
+                            block_table[:4],
+                        )
+                except Exception as e:  # pragma: no cover
+                    logger.warning(
+                        "GLM boundary debug logging failed: %s", e)
 
             # Multi-modal data
             # TODO: Replace with multi_modal_input_mapper
@@ -758,15 +803,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         # Convert lists to tensors and add padding
 
+        # Use -1 for padding. 0 is a valid physical KV block id and will corrupt
+        # attention if padded entries are consumed by paged kernels.
         block_tables = make_tensor_with_pad(block_tables_list,
                                             dtype=torch.int32,
                                             device="cpu",
-                                            pad=0)
+                                            pad=-1)
         if self.model_config.is_encoder_decoder:
             cross_block_tables = make_tensor_with_pad(cross_block_tables_list,
                                                       dtype=torch.int32,
                                                       device="cpu",
-                                                      pad=0)
+                                                      pad=-1)
         else:
             cross_block_tables = None
         if is_prompt:
@@ -808,18 +855,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 ])
                 block_tables = torch.cat([
                     block_tables,
-                    torch.zeros(batch_pad_len,
-                                block_tables.shape[1],
-                                dtype=torch.int32,
-                                device="cpu")
+                    torch.full((batch_pad_len, block_tables.shape[1]),
+                               -1,
+                               dtype=torch.int32,
+                               device="cpu")
                 ])
                 if self.model_config.is_encoder_decoder:
                     cross_block_tables = torch.cat([
                         cross_block_tables,
-                        torch.zeros(batch_pad_len,
-                                    cross_block_tables.shape[1],
-                                    dtype=torch.int32,
-                                    device="cpu")
+                        torch.full((batch_pad_len, cross_block_tables.shape[1]),
+                                   -1,
+                                   dtype=torch.int32,
+                                   device="cpu")
                     ])
                 if prompt_tokens_tensor is not None:
                     assert output_tokens_tensor is not None, (
@@ -827,17 +874,17 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                         "prompt_tokens_tensor is set")
                     prompt_tokens_tensor = torch.cat([
                         prompt_tokens_tensor,
-                        torch.zeros(batch_pad_len,
-                                    prompt_tokens_tensor.shape[1],
-                                    dtype=torch.int32,
-                                    device="cpu")
+                        torch.full((batch_pad_len, prompt_tokens_tensor.shape[1]),
+                                   -1,
+                                   dtype=torch.int32,
+                                   device="cpu")
                     ])
                     output_tokens_tensor = torch.cat([
                         output_tokens_tensor,
-                        torch.zeros(batch_pad_len,
-                                    output_tokens_tensor.shape[1],
-                                    dtype=torch.int32,
-                                    device="cpu")
+                        torch.full((batch_pad_len, output_tokens_tensor.shape[1]),
+                                   -1,
+                                   dtype=torch.int32,
+                                   device="cpu")
                     ])
 
                 seq_ids_tensor = torch.cat([
@@ -853,11 +900,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             if self.trace_mode in ["all", "decode_only"]:
                 block_tables = torch.cat([
                     block_tables,
-                    torch.zeros(block_tables.shape[0],
-                                self.cache_config.num_gpu_blocks -
-                                block_tables.shape[1],
-                                dtype=torch.int32,
-                                device="cpu")
+                    torch.full((block_tables.shape[0],
+                                self.max_blocks_per_seq -
+                                block_tables.shape[1]),
+                               -1,
+                               dtype=torch.int32,
+                               device="cpu")
                 ],
                                          dim=1)
                 if self.model_config.is_encoder_decoder:
@@ -866,11 +914,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     # or if prompts are text-only
                     cross_block_tables = torch.cat([
                         cross_block_tables,
-                        torch.zeros(cross_block_tables.shape[0],
+                        torch.full((cross_block_tables.shape[0],
                                     self.max_cross_blocks -
-                                    cross_block_tables.shape[1],
-                                    dtype=torch.int32,
-                                    device="cpu")
+                                    cross_block_tables.shape[1]),
+                                   -1,
+                                   dtype=torch.int32,
+                                   device="cpu")
                     ],
                                                    dim=1)
 
@@ -1161,6 +1210,34 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
             execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
         else:
             execute_model_kwargs["start_pos"] = model_input.input_positions
+            if os.environ.get(_GLM_DEBUG_PAGE_TABLE_BOUNDARY_ENV,
+                              "").strip() == "1":
+                try:
+                    start_pos = execute_model_kwargs["start_pos"]
+                    page_table = execute_model_kwargs["page_table"]
+                    if isinstance(start_pos, torch.Tensor) and isinstance(
+                            page_table, torch.Tensor) and start_pos.numel():
+                        pos_cpu = start_pos.detach().cpu()
+                        if ((pos_cpu >= 58) & (pos_cpu <= 70)).any():
+                            pt_cpu = page_table.detach().cpu()
+                            for batch_idx, pos in enumerate(pos_cpu.tolist()):
+                                pos_i = int(pos)
+                                if 58 <= pos_i <= 70:
+                                    head_w = min(4, int(pt_cpu.shape[1]))
+                                    head = pt_cpu[batch_idx, :head_w].tolist()
+                                    logger.info(
+                                        "GLM boundary debug (execute_step): "
+                                        "step=%s batch_idx=%s start_pos=%s "
+                                        "page_table_shape=%s page_table_head=%s",
+                                        step_idx,
+                                        batch_idx,
+                                        pos_i,
+                                        tuple(pt_cpu.shape),
+                                        head,
+                                    )
+                except Exception as e:  # pragma: no cover
+                    logger.warning(
+                        "GLM boundary debug execute logging failed: %s", e)
             # Only needed when sampling on device:
             # signals that decode batch has changed,
             # either due to a new user or
@@ -1483,5 +1560,5 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
         decode_warmup(self.model, kv_cache, trace_decode_mode,
                       self.scheduler_config.max_num_seqs,
-                      self.cache_config.num_gpu_blocks,
+                      self.max_blocks_per_seq,
                       self.sample_on_device_mode)
