@@ -331,12 +331,28 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
         self.trace_mode = trace_mode
         self.enable_model_warmup = enable_model_warmup
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
+
+        # Batch-bucketed traces: configurable via override_tt_config.
+        # When enabled, decode batches are padded to the nearest bucket
+        # instead of max_num_seqs, giving small batches more cores/seq.
+        self.decode_trace_batch_buckets: Optional[List[int]] = None
+        override_cfg = self.model_config.override_tt_config
+        if override_cfg and "decode_trace_batch_buckets" in override_cfg:
+            raw_buckets = override_cfg["decode_trace_batch_buckets"]
+            if isinstance(raw_buckets, list) and len(raw_buckets) > 0:
+                self.decode_trace_batch_buckets = sorted(int(b) for b in raw_buckets)
+                # Ensure max_num_seqs is reachable
+                if self.decode_trace_batch_buckets[-1] < self.scheduler_config.max_num_seqs:
+                    self.decode_trace_batch_buckets.append(self.scheduler_config.max_num_seqs)
+
         logger.info(
             "TTModelRunner: trace_mode=%s, "
-            "sample_on_device_mode=%s, enable_model_warmup=%s",
+            "sample_on_device_mode=%s, enable_model_warmup=%s, "
+            "decode_trace_batch_buckets=%s",
             self.trace_mode,
             self.sample_on_device_mode,
             self.enable_model_warmup,
+            self.decode_trace_batch_buckets,
         )
 
         # If sampling on device and in decode, delay reading the token
@@ -487,6 +503,24 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
 
         unpadded_batch_size = len(seq_group_metadata_list)
         assert unpadded_batch_size > 0
+
+        # Compute decode padding target once, used for both sampling params
+        # and tensor padding. When batch bucketing is active, we pad to the
+        # nearest bucket instead of max_num_seqs.
+        _use_bucketing = (
+            not is_prompt
+            and self.decode_trace_batch_buckets is not None
+            and self.trace_mode in ["all", "decode_only"]
+            and not self.dp_kv_cache
+        )
+        if _use_bucketing:
+            _decode_pad_target = self.scheduler_config.max_num_seqs  # fallback
+            for b in self.decode_trace_batch_buckets:
+                if b >= unpadded_batch_size:
+                    _decode_pad_target = b
+                    break
+        else:
+            _decode_pad_target = self.scheduler_config.max_num_seqs
 
         input_tokens_list: List[int] = []
         input_positions_list: List[int] = []
@@ -749,13 +783,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                 bool(lp) for lp in sampling_params_dict["logprobs"]
             ]
 
-            # Pad sampling params to max_num_seqs in decode mode for
-            # proper permutation
+            # Pad sampling params to decode pad target (bucket or max_num_seqs)
             # This must be done before permutation, just like tokens
             # and page_table
             if (not is_prompt and len(temp_list) > 0
-                    and len(temp_list) < self.scheduler_config.max_num_seqs):
-                batch_pad_len = (self.scheduler_config.max_num_seqs -
+                    and len(temp_list) < _decode_pad_target):
+                batch_pad_len = (_decode_pad_target -
                                  len(temp_list))
                 # Pad with default values for greedy/deterministic behavior
                 temp_list += [PADDING_TEMPERATURE] * batch_pad_len
@@ -836,10 +869,10 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                                           dtype=torch.int32,
                                           device="cpu")
 
-            # TODO: Remove once TT models can support arbitrary batch sizes
-            # Pad batch to max_num_seqs
-            if input_tokens.shape[0] < self.scheduler_config.max_num_seqs:
-                batch_pad_len = (self.scheduler_config.max_num_seqs -
+            # Pad batch to target size (bucket or max_num_seqs).
+            # _decode_pad_target was computed earlier based on batch bucketing config.
+            if input_tokens.shape[0] < _decode_pad_target:
+                batch_pad_len = (_decode_pad_target -
                                  input_tokens.shape[0])
                 input_tokens = torch.cat([
                     input_tokens,
@@ -892,7 +925,12 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                     torch.zeros(batch_pad_len, dtype=torch.int32, device="cpu")
                 ])
 
-            reset_batch = torch.any(seq_ids_tensor != self.prev_seq_ids_tensor)
+            # When batch bucketing changes the padded size between steps,
+            # the tensor lengths differ and we must force reset_batch=True.
+            if seq_ids_tensor.numel() != self.prev_seq_ids_tensor.numel():
+                reset_batch = True
+            else:
+                reset_batch = torch.any(seq_ids_tensor != self.prev_seq_ids_tensor)
             self.prev_seq_ids_tensor = seq_ids_tensor
 
             # Pad block_tables to max num blocks
@@ -1558,7 +1596,18 @@ class TTModelRunner(ModelRunnerBase[TTModelInput]):
                        self.scheduler_config.max_num_seqs)
 
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
-        decode_warmup(self.model, kv_cache, trace_decode_mode,
-                      self.scheduler_config.max_num_seqs,
-                      self.max_blocks_per_seq,
-                      self.sample_on_device_mode)
+
+        # When batch-bucketed traces are enabled, warm up each bucket size
+        # so traces are pre-captured at startup (avoids first-request latency).
+        if self.decode_trace_batch_buckets and trace_decode_mode:
+            for bucket in self.decode_trace_batch_buckets:
+                logger.info("Warming up decode trace for bucket B=%d", bucket)
+                decode_warmup(self.model, kv_cache, trace_decode_mode,
+                              bucket,
+                              self.max_blocks_per_seq,
+                              self.sample_on_device_mode)
+        else:
+            decode_warmup(self.model, kv_cache, trace_decode_mode,
+                          self.scheduler_config.max_num_seqs,
+                          self.max_blocks_per_seq,
+                          self.sample_on_device_mode)

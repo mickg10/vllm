@@ -676,6 +676,8 @@ def open_mesh_device(override_tt_config, trace_mode, local_dp_rank=0):
     )
     logger.info("multidevice with %d devices and grid %s is created",
                 mesh_device.get_num_devices(), mesh_grid)
+    mesh_device.enable_program_cache()
+    logger.info("Program cache enabled on mesh device")
     return mesh_device
 
 
