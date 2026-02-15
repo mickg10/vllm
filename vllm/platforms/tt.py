@@ -147,8 +147,11 @@ class TTPlatform(Platform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         assert not vllm_config.scheduler_config.chunked_prefill_enabled, (
             "Chunked prefill is not yet supported for TT backend")
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend")
+        if vllm_config.speculative_config:
+            logger.warning(
+                "Speculative decoding on TT backend is experimental. "
+                "Draft tokens are proposed but verification uses "
+                "scheduler-side rejection (no multi-token forward).")
         assert (vllm_config.parallel_config.tensor_parallel_size == 1
                 and vllm_config.parallel_config.pipeline_parallel_size
                 == 1), "TT backend does not support distributed execution"

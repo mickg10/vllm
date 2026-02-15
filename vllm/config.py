@@ -2776,7 +2776,8 @@ class SpeculativeConfig:
                 "architectures": ["MiMoMTPModel"]
             })
 
-        if hf_config.architectures[0] == "Glm4MoeForCausalLM":
+        if hf_config.architectures[0] in ("Glm4MoeForCausalLM",
+                                           "Glm4MoeLiteForCausalLM"):
             hf_config.model_type = "glm4_moe_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
             hf_config.update({
