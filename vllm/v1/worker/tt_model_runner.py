@@ -77,6 +77,11 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
+    # Batch-expansion spec decode: number of main request lanes (0 = inactive).
+    # When >0, slots [0..num_main_lanes-1] are main requests and
+    # [num_main_lanes..2*num_main_lanes-1] are draft verification lanes.
+    num_main_lanes: int = 0
+
 
 class TTModelRunner:
 
@@ -153,6 +158,8 @@ class TTModelRunner:
         self._scheduled_spec_decode_tokens: dict[str, list[int]] = {}
         # Maps spec_lane_index -> (req_index, draft_token) for verification.
         self._spec_decode_lanes: list[tuple[int, int]] = []
+        # Full model output for draft lane token recovery in batch expansion.
+        self._full_tt_out: Optional[torch.Tensor] = None
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -486,10 +493,10 @@ class TTModelRunner:
             reset_batch = self._decode_layout_changed_since_last_decode
             self._decode_layout_changed_since_last_decode = False
 
-            # Batch-expansion speculative decoding is disabled due to KV
-            # cache corruption with traced execution. MTP draft tokens are
-            # still proposed via spec_token_ids but all drafts are rejected
-            # by the scheduler (model returns 1 token per request).
+            # Check if batch-expansion speculative decoding is enabled
+            batch_expand_enabled = (
+                os.environ.get("GLM4_MOE_LITE_BATCH_EXPAND", "").strip() == "1"
+            )
             self._spec_decode_lanes = []
 
             # TODO: Remove once TT models can support arbitrary batch sizes.
@@ -516,6 +523,36 @@ class TTModelRunner:
                 # lanes reuse the padded slots' default sampling params
                 # (greedy), which is correct for verification.
                 sample_params.pad_with_defaults(num_reqs)
+
+            # Batch-expansion speculative decoding: when enabled AND the
+            # scheduler has scheduled spec decode tokens, expand the batch
+            # by placing draft verification tokens in padded slots.
+            # The model uses sequential paged_update_cache with -1 masks
+            # to serialize writes from aliased page_table entries.
+            # NOTE: This must happen AFTER padding so draft slots exist.
+            if batch_expand_enabled and self._scheduled_spec_decode_tokens:
+                for req_idx in range(num_reqs):
+                    req_id = input_batch.req_ids[req_idx]
+                    drafts = self._scheduled_spec_decode_tokens.get(req_id)
+                    if not drafts:
+                        continue
+                    draft_token = drafts[0]  # MTP k=1: one draft token
+                    draft_slot = num_reqs + req_idx
+                    if draft_slot >= input_batch.max_num_reqs:
+                        break  # no room for more draft lanes
+                    main_pos = int(input_positions[req_idx].item())
+                    if main_pos < 0:
+                        continue
+                    self._spec_decode_lanes.append(
+                        (req_idx, draft_token))
+                if self._spec_decode_lanes:
+                    for lane_idx, (req_idx, draft_token) in enumerate(
+                            self._spec_decode_lanes):
+                        draft_slot = num_reqs + lane_idx
+                        main_pos = int(input_positions[req_idx].item())
+                        input_tokens[draft_slot, 0] = draft_token
+                        input_positions[draft_slot] = main_pos + 1
+                        block_tables[draft_slot] = block_tables[req_idx]
 
         if is_prompt:
             tt_sampling_params = TTSamplingParams(
@@ -596,9 +633,7 @@ class TTModelRunner:
                                dtype=torch.int32)
                 ])
 
-        # When batch-expanding for spec decode, include spec lanes in the
-        # unpadded batch size so the model processes them.
-        effective_batch_size = num_reqs + len(self._spec_decode_lanes)
+        effective_batch_size = num_reqs
 
         return TTModelInput(
             input_tokens=input_tokens,
@@ -613,6 +648,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            num_main_lanes=num_reqs if self._spec_decode_lanes else 0,
         )
 
     def build_model_input(
@@ -1132,6 +1168,8 @@ class TTModelRunner:
                 kwargs["empty_slots"] = empty_slots
 
         kwargs["start_pos"] = model_input.input_positions
+        if model_input.num_main_lanes > 0:
+            kwargs["num_main_lanes"] = model_input.num_main_lanes
 
         # Sampling decision
         sampling_params = model_input.tt_sampling_params
@@ -1208,6 +1246,9 @@ class TTModelRunner:
             # v1 currently doesn't handle logprobs from TT models
             if isinstance(tt_out, tuple):
                 tt_out = tt_out[0]
+
+        # Save full output for draft lane token recovery in batch expansion.
+        self._full_tt_out = tt_out if self._spec_decode_lanes else None
 
         return self._get_output_tokens(
             tt_out=tt_out,
@@ -1392,32 +1433,13 @@ class TTModelRunner:
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         num_reqs = self.input_batch.num_reqs
-        num_spec_lanes = len(self._spec_decode_lanes)
-        expected_batch = num_reqs + num_spec_lanes
-        assert sampled_token_ids.shape[0] == expected_batch, (
+        assert sampled_token_ids.shape[0] == num_reqs, (
             f"Number of request outputs {sampled_token_ids.shape[0]} != "
-            f"expected batch {expected_batch} "
-            f"(num_reqs={num_reqs}, spec_lanes={num_spec_lanes})")
+            f"num_reqs={num_reqs}")
         num_out_tokens = sampled_token_ids.shape[1]
         assert num_out_tokens == 1, "Currently only supporting 1 output token"
 
-        # Split main lanes and spec lanes.
-        all_token_ids_np = sampled_token_ids.view(expected_batch).numpy()
-        main_token_ids_np = all_token_ids_np[:num_reqs]
-
-        # Perform greedy verification for batch-expanded spec decode.
-        # Build a map: req_index -> bonus_token (from spec lane) if accepted.
-        accepted_bonus: dict[int, int] = {}
-        if num_spec_lanes > 0:
-            spec_token_ids_np = all_token_ids_np[num_reqs:]
-            for lane_idx, (req_index, draft_token) in enumerate(
-                    self._spec_decode_lanes):
-                main_output = int(main_token_ids_np[req_index])
-                if main_output == draft_token:
-                    # Draft accepted: the spec lane's output is the bonus
-                    # token (model's prediction at position P+2).
-                    bonus_token = int(spec_token_ids_np[lane_idx])
-                    accepted_bonus[req_index] = bonus_token
+        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
 
         # Vectorized update of persistent batch token storage.
         start_idxs = self.input_batch.num_tokens[:num_reqs]
@@ -1429,25 +1451,15 @@ class TTModelRunner:
             f"{self.model_config.max_model_len}")
 
         rows = np.arange(num_reqs)
-        self.input_batch.token_ids_cpu[rows, start_idxs] = main_token_ids_np
+        self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
         self.input_batch.num_tokens[:num_reqs] = end_idxs
 
-        # For accepted drafts, also store the bonus token.
-        for req_index, bonus_token in accepted_bonus.items():
-            bonus_pos = self.input_batch.num_tokens[req_index]
-            assert bonus_pos < self.model_config.max_model_len, (
-                "Bonus token exceeds max model length")
-            self.input_batch.token_ids_cpu[req_index, bonus_pos] = bonus_token
-            self.input_batch.num_tokens[req_index] = bonus_pos + 1
-
         # Update request state (output token lists) without dict lookups.
-        sampled_token_ids_list_1d = main_token_ids_np.tolist()
+        sampled_token_ids_list_1d = sampled_token_ids_np.tolist()
         for req_idx in range(num_reqs):
             output_token_ids = self.input_batch.req_output_token_ids[req_idx]
             assert output_token_ids is not None
             output_token_ids.append(sampled_token_ids_list_1d[req_idx])
-            if req_idx in accepted_bonus:
-                output_token_ids.append(accepted_bonus[req_idx])
 
         # Empty prompt log probs
         prompt_logprobs_dict: dict[str,
@@ -1455,21 +1467,45 @@ class TTModelRunner:
                                        self.input_batch.req_ids[:num_reqs],
                                        None))
 
-        # Build output sampled_token_ids with variable length per request.
-        # Scheduler uses len(generated_token_ids) to compute rejections:
-        #   num_rejected = len(scheduled_spec) + 1 - len(generated)
-        # If 1 draft was scheduled and we return 2 tokens: 0 rejected (accept)
-        # If 1 draft was scheduled and we return 1 token: 1 rejected (reject)
-        output_token_ids_per_req: list[list[int]] = []
-        for req_idx in range(num_reqs):
-            main_token = sampled_token_ids_list_1d[req_idx]
-            if req_idx in accepted_bonus:
-                output_token_ids_per_req.append(
-                    [main_token, accepted_bonus[req_idx]])
-            else:
-                output_token_ids_per_req.append([main_token])
+        # Batch-expansion verification: compare main lane's sampled token
+        # with the draft token that was placed as input to the draft lane.
+        # If they match, accept both (main token + draft lane's output).
+        output_token_ids_per_req: list[list[int]] = [
+            [tok] for tok in sampled_token_ids_list_1d
+        ]
+        if self._spec_decode_lanes and self._full_tt_out is not None:
+            # Verify draft tokens: compare main lane's output with draft.
+            # If they match, the draft lane's output at slot num_reqs+lane_idx
+            # gives us the NEXT token (at position+1), yielding 2 tokens/step.
+            full_out = self._full_tt_out
+            for lane_idx, (req_idx, draft_token) in enumerate(
+                    self._spec_decode_lanes):
+                main_token = sampled_token_ids_list_1d[req_idx]
+                if main_token == draft_token:
+                    # Draft accepted: main lane confirmed the draft token.
+                    # Read the draft lane's sampled output at slot
+                    # num_reqs + lane_idx -- this is the token at position+1.
+                    draft_slot = num_reqs + lane_idx
+                    if draft_slot < full_out.shape[0]:
+                        bonus_token = int(full_out[draft_slot].item())
+                    else:
+                        # Fallback: can't read draft lane output
+                        continue
+                    output_token_ids_per_req[req_idx] = [
+                        main_token, bonus_token
+                    ]
+                    # Append bonus token to persistent state
+                    self.input_batch.token_ids_cpu[
+                        req_idx, end_idxs[req_idx]] = bonus_token
+                    self.input_batch.num_tokens[req_idx] += 1
+                    output_token_ids = self.input_batch.req_output_token_ids[
+                        req_idx]
+                    output_token_ids.append(bonus_token)
+            self._full_tt_out = None  # Release reference
 
         # Get MTP draft tokens if available (for NEXT step's speculation).
+        # Even without batch expansion verification, providing spec_token_ids
+        # lets the scheduler schedule extra tokens for the next step.
         spec_token_ids = None
         if self.speculative_config is not None and hasattr(
                 self.model, 'get_spec_token_ids'):
