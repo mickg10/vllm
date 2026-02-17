@@ -124,12 +124,29 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
+        # Batch-bucketed traces: configurable via override_tt_config.
+        # When enabled, decode batches are padded to the nearest bucket
+        # instead of max_num_seqs, giving small batches less work.
+        self.decode_trace_batch_buckets: Optional[list[int]] = None
+        override_cfg = self.model_config.override_tt_config
+        if override_cfg and "decode_trace_batch_buckets" in override_cfg:
+            raw_buckets = override_cfg["decode_trace_batch_buckets"]
+            if isinstance(raw_buckets, list) and len(raw_buckets) > 0:
+                self.decode_trace_batch_buckets = sorted(
+                    int(b) for b in raw_buckets)
+                if self.decode_trace_batch_buckets[-1] < \
+                        self.scheduler_config.max_num_seqs:
+                    self.decode_trace_batch_buckets.append(
+                        self.scheduler_config.max_num_seqs)
+
         logger.info(
             "TTModelRunner: trace_mode=%s, "
-            "sample_on_device_mode=%s, enable_model_warmup=%s",
+            "sample_on_device_mode=%s, enable_model_warmup=%s, "
+            "decode_trace_batch_buckets=%s",
             self.trace_mode,
             self.sample_on_device_mode,
             self.enable_model_warmup,
+            self.decode_trace_batch_buckets,
         )
 
         # req_id -> (input_id -> encoder_output)
@@ -499,10 +516,17 @@ class TTModelRunner:
             )
             self._spec_decode_lanes = []
 
-            # TODO: Remove once TT models can support arbitrary batch sizes.
-            # Pad batch to max_num_reqs.
-            if input_tokens.shape[0] < input_batch.max_num_reqs:
-                batch_pad = input_batch.max_num_reqs - input_tokens.shape[0]
+            # Compute decode pad target: nearest bucket or max_num_reqs.
+            decode_pad_target = input_batch.max_num_reqs
+            if (self.decode_trace_batch_buckets is not None
+                    and self.trace_mode in ["all", "decode_only"]):
+                for b in self.decode_trace_batch_buckets:
+                    if b >= input_tokens.shape[0]:
+                        decode_pad_target = b
+                        break
+
+            if input_tokens.shape[0] < decode_pad_target:
+                batch_pad = decode_pad_target - input_tokens.shape[0]
                 input_tokens = torch.cat([
                     input_tokens,
                     torch.zeros(batch_pad, 1, dtype=torch.int32)
@@ -538,7 +562,7 @@ class TTModelRunner:
                         continue
                     draft_token = drafts[0]  # MTP k=1: one draft token
                     draft_slot = num_reqs + req_idx
-                    if draft_slot >= input_batch.max_num_reqs:
+                    if draft_slot >= decode_pad_target:
                         break  # no room for more draft lanes
                     main_pos = int(input_positions[req_idx].item())
                     if main_pos < 0:
@@ -1533,7 +1557,16 @@ class TTModelRunner:
                        self.parallel_config.data_parallel_size)
 
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
-        decode_warmup(self.model, self.kv_caches, trace_decode_mode,
-                      self.scheduler_config.max_num_seqs,
-                      self.max_num_blocks_per_req, self.sample_on_device_mode,
-                      self.parallel_config.data_parallel_size)
+        if self.decode_trace_batch_buckets and trace_decode_mode:
+            for bucket in self.decode_trace_batch_buckets:
+                logger.info("Warming up decode trace for bucket B=%d", bucket)
+                decode_warmup(self.model, self.kv_caches, trace_decode_mode,
+                              bucket, self.max_num_blocks_per_req,
+                              self.sample_on_device_mode,
+                              self.parallel_config.data_parallel_size)
+        else:
+            decode_warmup(self.model, self.kv_caches, trace_decode_mode,
+                          self.scheduler_config.max_num_seqs,
+                          self.max_num_blocks_per_req,
+                          self.sample_on_device_mode,
+                          self.parallel_config.data_parallel_size)
