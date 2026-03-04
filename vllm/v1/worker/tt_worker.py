@@ -422,6 +422,14 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         max_tokens_all_users = 65536
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
+    elif (
+        "GLM-4.7-REAP" in model_config.model
+        and is_wormhole
+    ):
+        # GLM-4.7-REAP-218B/268B on Galaxy (32 WH chips, tight DRAM budget).
+        # 218B: 8.51 GB weights/device, ~3.49 GB free for KV+activations.
+        # 268B: 10.64 GB weights/device, ~1.36 GB free.
+        max_tokens_all_users = 32768
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
