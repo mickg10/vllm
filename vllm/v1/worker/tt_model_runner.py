@@ -103,6 +103,11 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
+    # Batch-expansion spec decode: number of main request lanes (0 = inactive).
+    # When >0, slots [0..num_main_lanes-1] are main requests and
+    # [num_main_lanes..2*num_main_lanes-1] are draft verification lanes.
+    num_main_lanes: int = 0
+
 
 class TTModelRunner:
     def __init__(
@@ -141,12 +146,29 @@ class TTModelRunner:
         # Whether to sample on device
         self.sample_on_device_mode = TTPlatform.sample_on_device_mode
 
+        # Batch-bucketed traces: configurable via override_tt_config.
+        # When enabled, decode batches are padded to the nearest bucket
+        # instead of max_num_seqs, giving small batches less work.
+        self.decode_trace_batch_buckets: list[int] | None = None
+        override_cfg = self.model_config.override_tt_config
+        if override_cfg and "decode_trace_batch_buckets" in override_cfg:
+            raw_buckets = override_cfg["decode_trace_batch_buckets"]
+            if isinstance(raw_buckets, list) and len(raw_buckets) > 0:
+                self.decode_trace_batch_buckets = sorted(
+                    int(b) for b in raw_buckets)
+                if self.decode_trace_batch_buckets[-1] < \
+                        self.scheduler_config.max_num_seqs:
+                    self.decode_trace_batch_buckets.append(
+                        self.scheduler_config.max_num_seqs)
+
         logger.info(
             "TTModelRunner: trace_mode=%s, "
-            "sample_on_device_mode=%s, enable_model_warmup=%s",
+            "sample_on_device_mode=%s, enable_model_warmup=%s, "
+            "decode_trace_batch_buckets=%s",
             self.trace_mode,
             self.sample_on_device_mode,
             self.enable_model_warmup,
+            self.decode_trace_batch_buckets,
         )
 
         # mm_hash -> encoder_output
@@ -168,6 +190,15 @@ class TTModelRunner:
         # change during prefill steps (e.g. new requests added), so we keep a
         # sticky flag and clear it only after a decode input consumes it.
         self._decode_layout_changed_since_last_decode: bool = True
+
+        # Batch-expansion speculative decoding state.
+        # Maps req_id -> list[int] of draft token ids scheduled for
+        # verification in the current step.
+        self._scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # Maps spec_lane_index -> (req_index, draft_token) for verification.
+        self._spec_decode_lanes: list[tuple[int, int]] = []
+        # Full model output for draft lane token recovery in batch expansion.
+        self._full_tt_out: torch.Tensor | None = None
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -577,10 +608,24 @@ class TTModelRunner:
             reset_batch = self._decode_layout_changed_since_last_decode
             self._decode_layout_changed_since_last_decode = False
 
-            # TODO: Remove once TT models can support arbitrary batch sizes.
-            # Pad batch to max_num_reqs.
-            if input_tokens.shape[0] < input_batch.max_num_reqs:
-                batch_pad = input_batch.max_num_reqs - input_tokens.shape[0]
+            # Check if batch-expansion speculative decoding is enabled
+            batch_expand_enabled = (
+                os.environ.get("GLM4_MOE_LITE_BATCH_EXPAND", "").strip()
+                == "1"
+            )
+            self._spec_decode_lanes = []
+
+            # Compute decode pad target: nearest bucket or max_num_reqs.
+            decode_pad_target = input_batch.max_num_reqs
+            if (self.decode_trace_batch_buckets is not None
+                    and self.trace_mode in ["all", "decode_only"]):
+                for b in self.decode_trace_batch_buckets:
+                    if b >= input_tokens.shape[0]:
+                        decode_pad_target = b
+                        break
+
+            if input_tokens.shape[0] < decode_pad_target:
+                batch_pad = decode_pad_target - input_tokens.shape[0]
                 input_tokens = torch.cat(
                     [input_tokens, torch.zeros(batch_pad, 1, dtype=torch.int32)]
                 )
@@ -596,8 +641,38 @@ class TTModelRunner:
                         ),
                     ]
                 )
-                # Pad sampling parameters with default values
+                # Pad sampling parameters with default values.
+                # NOTE: When batch-expanding for spec decode, the draft
+                # lanes reuse the padded slots' default sampling params
+                # (greedy), which is correct for verification.
                 sample_params.pad_with_defaults(num_reqs)
+
+            # Batch-expansion speculative decoding: when enabled AND the
+            # scheduler has scheduled spec decode tokens, expand the batch
+            # by placing draft verification tokens in padded slots.
+            if batch_expand_enabled and self._scheduled_spec_decode_tokens:
+                for req_idx in range(num_reqs):
+                    req_id = input_batch.req_ids[req_idx]
+                    drafts = self._scheduled_spec_decode_tokens.get(req_id)
+                    if not drafts:
+                        continue
+                    draft_token = drafts[0]  # MTP k=1: one draft token
+                    draft_slot = num_reqs + req_idx
+                    if draft_slot >= decode_pad_target:
+                        break  # no room for more draft lanes
+                    main_pos = int(input_positions[req_idx].item())
+                    if main_pos < 0:
+                        continue
+                    self._spec_decode_lanes.append(
+                        (req_idx, draft_token))
+                if self._spec_decode_lanes:
+                    for lane_idx, (req_idx, draft_token) in enumerate(
+                            self._spec_decode_lanes):
+                        draft_slot = num_reqs + lane_idx
+                        main_pos = int(input_positions[req_idx].item())
+                        input_tokens[draft_slot, 0] = draft_token
+                        input_positions[draft_slot] = main_pos + 1
+                        block_tables[draft_slot] = block_tables[req_idx]
 
         if is_prompt:
             # Convert num_logprobs (int tensor)
@@ -739,6 +814,7 @@ class TTModelRunner:
             prompt_tokens=prompt_tokens,
             output_tokens=output_tokens,
             reset_batch=reset_batch,
+            num_main_lanes=num_reqs if self._spec_decode_lanes else 0,
             # Host-only sampling params - wrapped in lists for DP compatibility
             allowed_token_ids_mask_list=[allowed_token_ids_mask],
             bad_words_token_ids_list=[input_batch.sampling.bad_words_token_ids],
@@ -1301,6 +1377,10 @@ class TTModelRunner:
         # With DP, the actual model pass happens on a batch
         # produced by concatenating the inputs from all DP ranks.
 
+        # Store spec decode tokens for batch expansion in _prepare_model_inputs
+        self._scheduled_spec_decode_tokens = (
+            scheduler_output.scheduled_spec_decode_tokens)
+
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
         if model_input is None:
@@ -1410,6 +1490,8 @@ class TTModelRunner:
                 kwargs["empty_slots"] = empty_slots
 
         kwargs["start_pos"] = model_input.input_positions
+        if model_input.num_main_lanes > 0:
+            kwargs["num_main_lanes"] = model_input.num_main_lanes
 
         # Sampling decision
         sampling_params = model_input.tt_sampling_params
@@ -1495,6 +1577,9 @@ class TTModelRunner:
         elif isinstance(tt_out, tuple):
             # Model may return (logits, dummy_logprobs) even when not requested
             tt_out, _ = tt_out
+
+        # Save full output for draft lane token recovery in batch expansion.
+        self._full_tt_out = tt_out if self._spec_decode_lanes else None
 
         return self._get_output_tokens(
             tt_out=tt_out,
@@ -1780,27 +1865,58 @@ class TTModelRunner:
         self.input_batch.num_tokens[:num_reqs] = end_idxs
 
         # Update request state (output token lists) without dict lookups.
-        # NOTE: `InputBatch.req_output_token_ids[i]` is a direct reference to
-        # the underlying `CachedRequestState.output_token_ids` list (stored in
-        # `self.requests[req_id]`). Appending here updates request state too,
-        # while avoiding a per-request dict lookup.
+        sampled_token_ids_list_1d = sampled_token_ids_np.tolist()
         for req_idx in range(num_reqs):
             output_token_ids = self.input_batch.req_output_token_ids[req_idx]
             assert output_token_ids is not None
             output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+
+        # Batch-expansion verification: compare main lane's sampled token
+        # with the draft token that was placed as input to the draft lane.
+        # If they match, accept both (main token + draft lane's output).
+        output_token_ids_per_req: list[np.ndarray] = [
+            sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
+        ]
+        if self._spec_decode_lanes and self._full_tt_out is not None:
+            full_out = self._full_tt_out
+            for lane_idx, (req_idx, draft_token) in enumerate(
+                    self._spec_decode_lanes):
+                main_token = sampled_token_ids_list_1d[req_idx]
+                if main_token == draft_token:
+                    # Draft accepted: main lane confirmed the draft token.
+                    # Read the draft lane's sampled output at slot
+                    # num_reqs + lane_idx — this is the token at position+1.
+                    draft_slot = num_reqs + lane_idx
+                    if draft_slot < full_out.shape[0]:
+                        bonus_token = int(full_out[draft_slot].item())
+                    else:
+                        continue
+                    output_token_ids_per_req[req_idx] = np.array(
+                        [main_token, bonus_token], dtype=np.int32
+                    )
+                    # Append bonus token to persistent state
+                    self.input_batch.token_ids_cpu[
+                        req_idx, end_idxs[req_idx]] = bonus_token
+                    self.input_batch.num_tokens[req_idx] += 1
+                    out_toks = self.input_batch.req_output_token_ids[
+                        req_idx]
+                    out_toks.append(bonus_token)
+            self._full_tt_out = None  # Release reference
+
+        # Clear spec decode state for next step.
+        self._spec_decode_lanes = []
+        self._scheduled_spec_decode_tokens = {}
 
         # Empty prompt log probs
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
             self.input_batch.req_ids[:num_reqs], None
         )
 
-        # Note: currently does not support speculative decoding or pooling.
+        # Note: currently does not support log probs or pooling.
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[
-                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
-            ],
+            sampled_token_ids=output_token_ids_per_req,
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
@@ -1818,12 +1934,27 @@ class TTModelRunner:
 
         # Warmup decode
         trace_decode_mode = self.trace_mode in ["all", "decode_only"]
-        self.model.warmup_model_decode(
-            kv_cache=self.kv_caches,
-            enable_trace=trace_decode_mode,
-            max_batch_size=self.scheduler_config.max_num_seqs
-            * self.parallel_config.data_parallel_size,
-            num_blocks=self.max_num_blocks_per_req,
-            can_sample_on_device=self.sample_on_device_mode in ["all", "decode_only"],
-            non_greedy_decoding_on_device=TTPlatform.non_greedy_decoding_on_device,
-        )
+        dp_size = self.parallel_config.data_parallel_size
+        can_sample = self.sample_on_device_mode in ["all", "decode_only"]
+        non_greedy = TTPlatform.non_greedy_decoding_on_device
+        if self.decode_trace_batch_buckets and trace_decode_mode:
+            for bucket in self.decode_trace_batch_buckets:
+                logger.info("Warming up decode trace for bucket B=%d",
+                            bucket)
+                self.model.warmup_model_decode(
+                    kv_cache=self.kv_caches,
+                    enable_trace=trace_decode_mode,
+                    max_batch_size=bucket * dp_size,
+                    num_blocks=self.max_num_blocks_per_req,
+                    can_sample_on_device=can_sample,
+                    non_greedy_decoding_on_device=non_greedy,
+                )
+        else:
+            self.model.warmup_model_decode(
+                kv_cache=self.kv_caches,
+                enable_trace=trace_decode_mode,
+                max_batch_size=self.scheduler_config.max_num_seqs * dp_size,
+                num_blocks=self.max_num_blocks_per_req,
+                can_sample_on_device=can_sample,
+                non_greedy_decoding_on_device=non_greedy,
+            )
