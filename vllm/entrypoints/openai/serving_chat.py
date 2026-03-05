@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -219,11 +220,19 @@ class OpenAIServingChat(OpenAIServing):
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
 
+            # GLM-4.x chat templates default to emitting <think> unless the
+            # caller passes {"enable_thinking": False} via chat_template_kwargs.
+            # Most UI clients don't set this, so allow a server-side default.
+            chat_template_kwargs = request.chat_template_kwargs
+            if os.environ.get("GLM_DEFAULT_DISABLE_THINKING", "0") == "1":
+                chat_template_kwargs = dict(chat_template_kwargs or {})
+                chat_template_kwargs.setdefault("enable_thinking", False)
+
             if not self.use_harmony:
                 # Common case.
                 error_check_ret = self._validate_chat_template(
                     request_chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs,
+                    chat_template_kwargs=chat_template_kwargs,
                     trust_request_chat_template=self.trust_request_chat_template,
                 )
                 if error_check_ret is not None:
@@ -242,7 +251,7 @@ class OpenAIServingChat(OpenAIServing):
                     continue_final_message=request.continue_final_message,
                     tool_dicts=tool_dicts,
                     documents=request.documents,
-                    chat_template_kwargs=request.chat_template_kwargs,
+                    chat_template_kwargs=chat_template_kwargs,
                     tool_parser=tool_parser,
                     add_special_tokens=request.add_special_tokens,
                 )
@@ -577,9 +586,13 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             if self.reasoning_parser:
+                _rp_kwargs = request.chat_template_kwargs
+                if os.environ.get("GLM_DEFAULT_DISABLE_THINKING", "0") == "1":
+                    _rp_kwargs = dict(_rp_kwargs or {})
+                    _rp_kwargs.setdefault("enable_thinking", False)
                 reasoning_parser = self.reasoning_parser(
                     tokenizer,
-                    chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
+                    chat_template_kwargs=_rp_kwargs,  # type: ignore
                 )
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
@@ -1377,9 +1390,14 @@ class OpenAIServingChat(OpenAIServing):
 
             if self.reasoning_parser:
                 try:
+                    _rp_kwargs = request.chat_template_kwargs
+                    if os.environ.get(
+                            "GLM_DEFAULT_DISABLE_THINKING", "0") == "1":
+                        _rp_kwargs = dict(_rp_kwargs or {})
+                        _rp_kwargs.setdefault("enable_thinking", False)
                     reasoning_parser = self.reasoning_parser(
                         tokenizer,
-                        chat_template_kwargs=request.chat_template_kwargs,  # type: ignore
+                        chat_template_kwargs=_rp_kwargs,  # type: ignore
                     )
                 except RuntimeError as e:
                     logger.exception("Error in reasoning parser creation.")

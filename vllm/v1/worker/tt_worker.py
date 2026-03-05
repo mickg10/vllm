@@ -422,6 +422,13 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         max_tokens_all_users = 65536
     elif "DeepSeek-R1-0528" in model_config.model and is_wormhole:
         max_tokens_all_users = 32768
+    elif (
+        "GLM-4.7-Flash" in model_config.model
+        and is_wormhole
+    ):
+        # GLM-4.7-Flash (47B MoE) uses MLA KVPE caching and is DRAM heavy.
+        # Tight memory budget especially on T3K (8 devices).
+        max_tokens_all_users = 32768
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072

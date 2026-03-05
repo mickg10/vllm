@@ -32,6 +32,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "ernie45_reasoning_parser",
         "Ernie45ReasoningParser",
     ),
+    "glm4_moe": (
+        "glm4_moe_reasoning_parser",
+        "Glm4MoeModelReasoningParser",
+    ),
     "glm45": (
         "glm4_moe_reasoning_parser",
         "Glm4MoeModelReasoningParser",

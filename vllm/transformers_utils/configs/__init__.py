@@ -18,6 +18,7 @@ from vllm.transformers_utils.configs.eagle import EAGLEConfig
 # `FalconConfig` class from the official HuggingFace transformers library.
 from vllm.transformers_utils.configs.falcon import RWConfig
 from vllm.transformers_utils.configs.flex_olmo import FlexOlmoConfig
+from vllm.transformers_utils.configs.glm4_moe_lite import Glm4MoeLiteConfig
 from vllm.transformers_utils.configs.jais import JAISConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.transformers_utils.configs.kimi_vl import KimiVLConfig
@@ -47,6 +48,7 @@ __all__ = [
     "DotsOCRConfig",
     "EAGLEConfig",
     "FlexOlmoConfig",
+    "Glm4MoeLiteConfig",
     "RWConfig",
     "JAISConfig",
     "Lfm2MoeConfig",

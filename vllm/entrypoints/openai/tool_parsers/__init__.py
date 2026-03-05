@@ -34,7 +34,15 @@ _TOOL_PARSERS_TO_REGISTER = {
         "ernie45_tool_parser",
         "Ernie45ToolParser",
     ),
+    "glm4_moe": (
+        "glm4_moe_tool_parser",
+        "Glm4MoeModelToolParser",
+    ),
     "glm45": (
+        "glm4_moe_tool_parser",
+        "Glm4MoeModelToolParser",
+    ),
+    "glm47": (
         "glm4_moe_tool_parser",
         "Glm4MoeModelToolParser",
     ),
