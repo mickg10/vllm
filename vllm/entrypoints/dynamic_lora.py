@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import model_hosting_container_standards.sagemaker as sagemaker_standards
+try:
+    import model_hosting_container_standards.sagemaker as sagemaker_standards
+except ModuleNotFoundError:
+    sagemaker_standards = None  # type: ignore[assignment]
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 

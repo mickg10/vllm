@@ -3,7 +3,10 @@
 import json
 from http import HTTPStatus
 
-import model_hosting_container_standards.sagemaker as sagemaker_standards
+try:
+    import model_hosting_container_standards.sagemaker as sagemaker_standards
+except ModuleNotFoundError:
+    sagemaker_standards = None  # type: ignore[assignment]
 import pydantic
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
