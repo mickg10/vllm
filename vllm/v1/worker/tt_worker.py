@@ -214,6 +214,10 @@ class TTWorker(WorkerBase):
         output = self.model_runner.execute_model(scheduler_output)
         return output
 
+    def take_draft_token_ids(self):
+        """Delegate to model runner for MTP draft token extraction."""
+        return self.model_runner.take_draft_token_ids()
+
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return
@@ -430,6 +434,14 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         # 218B: 8.51 GB weights/device, ~3.49 GB free for KV+activations.
         # 268B: 10.64 GB weights/device, ~1.36 GB free.
         max_tokens_all_users = 4096
+    elif (
+        "GLM-4.7" in model_config.model
+        and is_wormhole
+    ):
+        # GLM-4.7 base (358B) on Galaxy (32 WH chips, very tight DRAM).
+        # 160 experts (vs REAP's 96) — more weight memory, less KV room.
+        # ~8 GB weights/device with all-BF4 experts + BF8 dense.
+        max_tokens_all_users = 1024
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072

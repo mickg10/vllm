@@ -185,6 +185,24 @@ class TTModelRunner:
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
 
+        # MTP draft token ids from the most recent decode step (Phase 1:
+        # metrics only, not used for speculative scheduling).
+        self._draft_token_ids: list[list[int]] | None = None
+
+    def take_draft_token_ids(self) -> "DraftTokenIds | None":
+        """Return and consume MTP draft token ids from the last decode step.
+
+        Phase 1: provides draft tokens for acceptance-rate metrics only;
+        speculative scheduling is NOT enabled.
+        """
+        if self._draft_token_ids is None:
+            return None
+        from vllm.v1.outputs import DraftTokenIds
+        req_ids = list(self.input_batch.req_ids)
+        draft_token_ids = self._draft_token_ids
+        self._draft_token_ids = None
+        return DraftTokenIds(req_ids, draft_token_ids)
+
     def load_model(self) -> None:
         loader = TTModelLoader(self.load_config)
         self.model = loader.load_model(
@@ -1482,6 +1500,17 @@ class TTModelRunner:
                 enable_trace=enable_trace,
                 read_from_device=True,
             )
+
+        # Extract MTP draft tokens if available (Phase 1: metrics only).
+        if is_decode and hasattr(self.model, '_last_draft_token_ids') and self.model._last_draft_token_ids is not None:
+            draft_ids = self.model._last_draft_token_ids
+            if isinstance(draft_ids, torch.Tensor):
+                self._draft_token_ids = [[int(x)] for x in draft_ids.tolist()]
+            else:
+                self._draft_token_ids = [[int(x)] for x in draft_ids]
+            self.model._last_draft_token_ids = None
+        else:
+            self._draft_token_ids = None
 
         # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
         # sampling is enabled with logprobs. Extract both components.
