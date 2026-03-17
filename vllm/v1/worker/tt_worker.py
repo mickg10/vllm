@@ -438,10 +438,11 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         "GLM-4.7" in model_config.model
         and is_wormhole
     ):
-        # GLM-4.7 base (358B) on Galaxy (32 WH chips, very tight DRAM).
-        # 160 experts (vs REAP's 96) — more weight memory, less KV room.
-        # ~8 GB weights/device with all-BF4 experts + BF8 dense.
-        max_tokens_all_users = 1024
+        # GLM-4.7 base (358B) on Galaxy (32 WH chips).
+        # All-BF4 experts: ~7.7 GB weights/device, ~3.8 GB free.
+        # DP=4, bs=8 -> 2 users/DP group. 16K ctx × 2 users = 32K tokens.
+        # BF16 KV: 32K × 92 layers × 512 B = 1.54 GB (fits).
+        max_tokens_all_users = 32768
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072

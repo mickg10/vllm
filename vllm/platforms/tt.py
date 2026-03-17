@@ -237,9 +237,14 @@ class TTPlatform(Platform):
         assert not vllm_config.scheduler_config.chunked_prefill_enabled, (
             "Chunked prefill is not yet supported for TT backend"
         )
-        assert not vllm_config.speculative_config, (
-            "Speculative decoding is not yet supported for TT backend"
-        )
+        if vllm_config.speculative_config:
+            spec_cfg = vllm_config.speculative_config
+            # Only allow MTP-based speculation (no external draft model).
+            # EAGLE uses the same MTP infrastructure internally.
+            assert spec_cfg.use_eagle() or getattr(spec_cfg, 'method', None) == "mtp", (
+                f"Only MTP/EAGLE speculative decoding supported on TT, "
+                f"got method={getattr(spec_cfg, 'method', 'unknown')}"
+            )
         assert (
             vllm_config.parallel_config.tensor_parallel_size == 1
             and vllm_config.parallel_config.pipeline_parallel_size == 1

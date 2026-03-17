@@ -103,6 +103,11 @@ class TTModelInput:
     # previous step (used by on-device sampling).
     reset_batch: bool = False
 
+    # Verification mode metadata (set only during spec decode verify step)
+    _verify_mode: bool = False
+    _verify_num_reqs: int = 0
+    _verify_draft_token_ids: list[list[int]] | None = None
+
 
 class TTModelRunner:
     def __init__(
@@ -185,15 +190,24 @@ class TTModelRunner:
             custom_logitsprocs=(self.model_config.logits_processors or ()),
         )
 
-        # MTP draft token ids from the most recent decode step (Phase 1:
-        # metrics only, not used for speculative scheduling).
+        # MTP draft token ids from the most recent decode step.
+        # Fed to scheduler via take_draft_token_ids() -> core.py post_step().
         self._draft_token_ids: list[list[int]] | None = None
+
+        # Whether speculative decoding is active (controls verify path).
+        self._use_spec_decode: bool = (
+            vllm_config.speculative_config is not None
+        )
+        self._tt_spec_decode_enabled: bool = (
+            self._use_spec_decode
+            and os.environ.get("TT_SPEC_DECODE", "1").strip() != "0"
+        )
 
     def take_draft_token_ids(self) -> "DraftTokenIds | None":
         """Return and consume MTP draft token ids from the last decode step.
 
-        Phase 1: provides draft tokens for acceptance-rate metrics only;
-        speculative scheduling is NOT enabled.
+        When speculative decoding is enabled, these feed the scheduler's
+        spec scheduling pipeline (scheduled_spec_decode_tokens).
         """
         if self._draft_token_ids is None:
             return None
@@ -554,6 +568,24 @@ class TTModelRunner:
         is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
             cached_reqs.resumed_req_ids
         )
+
+        # Check for speculative verification mode
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        is_verify = (
+            not is_prompt
+            and self._tt_spec_decode_enabled
+            and bool(spec_decode_tokens)
+            and num_reqs <= 16  # effective batch 32 = kernel cap
+        )
+
+        if is_verify:
+            return self._prepare_verify_inputs(
+                scheduler_output=scheduler_output,
+                spec_decode_tokens=spec_decode_tokens,
+                block_tables=block_tables,
+                input_batch=input_batch,
+            )
+
         sample_params = input_batch.sampling
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
@@ -763,6 +795,121 @@ class TTModelRunner:
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[input_batch.sampling.logitsprocs],
             generators_list=[generators],
+        )
+
+    def _prepare_verify_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_tokens: dict[str, list[int]],
+        block_tables: torch.Tensor,
+        input_batch: "InputBatch",
+    ) -> TTModelInput:
+        """Prepare doubled-batch inputs for approximate verification.
+
+        For K=1: interleave main and draft tokens to create effective batch 2B.
+        Layout: [main_0, draft_0, main_1, draft_1, ...] (2*num_reqs entries).
+        Positions: [P_0, P_0+1, P_1, P_1+1, ...]
+        Page tables: [bt_0, bt_0, bt_1, bt_1, ...]
+        """
+        num_reqs = input_batch.num_reqs
+
+        # Build interleaved tensors
+        verify_tokens = []
+        verify_positions = []
+        verify_block_tables = []
+
+        for i in range(num_reqs):
+            req_id = input_batch.req_ids[i]
+            main_pos = int(input_batch.num_tokens[i]) - 1
+            main_token = int(
+                input_batch.token_ids_cpu_tensor[i, main_pos].item()
+            )
+
+            # Draft token: from scheduler's spec_decode_tokens
+            draft_ids = spec_decode_tokens.get(req_id, [])
+            draft_token = draft_ids[0] if draft_ids else main_token
+
+            bt = block_tables[i]
+
+            # Main entry
+            verify_tokens.append(main_token)
+            verify_positions.append(main_pos)
+            verify_block_tables.append(bt)
+
+            # Draft entry (same page table row!)
+            verify_tokens.append(draft_token)
+            verify_positions.append(main_pos + 1)
+            verify_block_tables.append(bt)
+
+        effective_batch = 2 * num_reqs
+
+        input_tokens = torch.tensor(
+            verify_tokens, dtype=torch.int32
+        ).unsqueeze(1)  # [2B, 1]
+        input_positions = torch.tensor(
+            verify_positions, dtype=torch.int32
+        )  # [2B]
+        verify_bt = torch.stack(verify_block_tables)  # [2B, W]
+
+        # Pad to max_num_reqs for the model (same as normal decode).
+        # For verify, we may need up to 32 (kernel limit).
+        max_verify_batch = min(
+            2 * self.scheduler_config.max_num_seqs, 32
+        )
+        if effective_batch < max_verify_batch:
+            pad = max_verify_batch - effective_batch
+            input_tokens = torch.cat(
+                [input_tokens, torch.zeros(pad, 1, dtype=torch.int32)]
+            )
+            input_positions = torch.cat(
+                [input_positions, torch.full((pad,), -1, dtype=torch.int32)]
+            )
+            verify_bt = torch.cat(
+                [
+                    verify_bt,
+                    torch.zeros(pad, verify_bt.shape[1], dtype=torch.int32),
+                ]
+            )
+
+        # Disable device sampling for verify step (use host rejection sampler)
+        perform_device_sampling = False
+
+        # Build dummy sampling params for the doubled batch
+        sample_params = input_batch.sampling
+        enable_log_probs = sample_params.num_logprobs > 0
+        tt_sampling_params = TTSamplingParams(
+            temperature=sample_params.temperature,
+            top_k=sample_params.top_k,
+            top_p=sample_params.top_p,
+            presence_penalty=sample_params.presence_penalty,
+            frequency_penalty=sample_params.frequency_penalty,
+            repetition_penalty=sample_params.repetition_penalty,
+            seed=sample_params.seed,
+            enable_log_probs=enable_log_probs,
+        )
+
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=None,  # decode mode
+            block_tables=verify_bt,
+            unpadded_batch_size=effective_batch,
+            tt_sampling_params=tt_sampling_params,
+            multi_modal_kwargs={},
+            perform_device_sampling=perform_device_sampling,
+            grammar_bitmask=[None],
+            logitsprocs_list=[None],
+            bad_words_token_ids_list=[{}],
+            allowed_token_ids_mask_list=[None],
+            generators_list=[{}],
+            max_num_logprobs=[0],
+            # Verification metadata
+            _verify_mode=True,
+            _verify_num_reqs=num_reqs,
+            _verify_draft_token_ids=[
+                spec_decode_tokens.get(req_id, [])
+                for req_id in input_batch.req_ids[:num_reqs]
+            ],
         )
 
     def build_model_input(
@@ -1493,6 +1640,14 @@ class TTModelRunner:
                 self.previous_req_ids = set(self.input_batch.req_ids)
 
             enable_trace = self.trace_mode in ["all", "decode_only"]
+
+            # Signal verify mode to model for trace bucket selection
+            if getattr(model_input, '_verify_mode', False):
+                if hasattr(self.model, '_tt_runner') and self.model._tt_runner is not None:
+                    object.__setattr__(
+                        self.model._tt_runner, '_is_verify_batch', True
+                    )
+
             # In the DP case, the model outputs for all ranks are concatenated.
             tt_out = self.model.decode_forward(
                 **kwargs,
@@ -1501,7 +1656,22 @@ class TTModelRunner:
                 read_from_device=True,
             )
 
-        # Extract MTP draft tokens if available (Phase 1: metrics only).
+            # Clear verify mode flag
+            if hasattr(self.model, '_tt_runner') and self.model._tt_runner is not None:
+                object.__setattr__(
+                    self.model._tt_runner, '_is_verify_batch', False
+                )
+
+        # --- Verification post-processing ---
+        if is_decode and getattr(model_input, '_verify_mode', False):
+            return self._process_verify_output(
+                tt_out=tt_out,
+                model_input=model_input,
+                sampling_params=sampling_params,
+                batch_size_per_dp=batch_size_per_dp,
+            )
+
+        # Extract MTP draft tokens if available.
         if is_decode and hasattr(self.model, '_last_draft_token_ids') and self.model._last_draft_token_ids is not None:
             draft_ids = self.model._last_draft_token_ids
             if isinstance(draft_ids, torch.Tensor):
@@ -1769,6 +1939,90 @@ class TTModelRunner:
         ]
         logits.masked_fill_(unpacked_bitmask, -float("inf"))
 
+    def _process_verify_output(
+        self,
+        tt_out: torch.Tensor,
+        model_input: TTModelInput,
+        sampling_params: TTSamplingParams,
+        batch_size_per_dp: list[int],
+    ) -> tuple[list[torch.Tensor], list[LogprobsTensors | None]]:
+        """Process verification output: rejection sampling on doubled batch.
+
+        tt_out shape: [2B_padded, 1, vocab] (logits) or [2B_padded, vocab].
+        For verification we always use host sampling (logits path).
+
+        Returns sampled_token_ids_per_dp with [num_reqs, 2] tensor
+        (2 tokens if draft accepted, 1 token + -1 pad if rejected).
+        """
+        from vllm.v1.worker.tt_rejection_sampler import TTRejectionSampler
+
+        num_reqs = model_input._verify_num_reqs
+        draft_token_ids = model_input._verify_draft_token_ids
+        effective_batch = 2 * num_reqs
+
+        # Extract logits -- tt_out is [padded_batch, 1, vocab] or similar
+        if tt_out.ndim == 3:
+            logits = tt_out[:effective_batch, -1, :]  # [2B, vocab]
+        elif tt_out.ndim == 2:
+            logits = tt_out[:effective_batch, :]  # [2B, vocab]
+        else:
+            logits = tt_out[:effective_batch].unsqueeze(-1)
+
+        # Split into main (even indices) and draft (odd indices)
+        main_logits = logits[0::2]  # [B, vocab]
+        draft_logits = logits[1::2]  # [B, vocab]
+
+        # Run rejection sampling
+        if not hasattr(self, '_tt_rejection_sampler'):
+            self._tt_rejection_sampler = TTRejectionSampler()
+
+        result = self._tt_rejection_sampler(
+            draft_token_ids=draft_token_ids,
+            main_logits=main_logits,
+            draft_logits=draft_logits,
+        )
+
+        # Build output tensor: [num_reqs, 2] with -1 padding for rejected
+        max_out_len = 2  # K + 1
+        sampled = torch.full(
+            (num_reqs, max_out_len), -1, dtype=torch.int32
+        )
+        for b in range(num_reqs):
+            out = result.output_token_ids[b]
+            sampled[b, :len(out)] = torch.from_numpy(out)
+
+        # Extract MTP drafts based on rejection result.
+        # For each request b:
+        #   accepted: use draft from odd index (2*b+1) = draft position's MTP output
+        #   rejected: use draft from even index (2*b) = main position's MTP output
+        raw_drafts = getattr(self.model, '_last_draft_token_ids', None)
+        if raw_drafts is not None and len(raw_drafts) >= 2 * num_reqs:
+            next_drafts = []
+            for b in range(num_reqs):
+                if result.num_accepted[b] > 0:
+                    # Draft accepted: MTP should predict from draft position
+                    next_drafts.append([int(raw_drafts[2*b + 1])])
+                else:
+                    # Draft rejected: MTP predicts from main position
+                    next_drafts.append([int(raw_drafts[2*b])])
+            self._draft_token_ids = next_drafts
+            self.model._last_draft_token_ids = None
+        else:
+            # Fall back: extract normal draft tokens
+            if hasattr(self.model, '_last_draft_token_ids') and self.model._last_draft_token_ids is not None:
+                draft_ids = self.model._last_draft_token_ids
+                if isinstance(draft_ids, torch.Tensor):
+                    self._draft_token_ids = [[int(x)] for x in draft_ids.tolist()[:num_reqs]]
+                else:
+                    self._draft_token_ids = [[int(x)] for x in list(draft_ids)[:num_reqs]]
+                self.model._last_draft_token_ids = None
+            else:
+                self._draft_token_ids = None
+
+        sampled_token_ids_per_dp = [sampled]
+        logprobs_per_dp: list[LogprobsTensors | None] = [None]
+        return sampled_token_ids_per_dp, logprobs_per_dp
+
     def generate_runner_output(
         self,
         sampled_token_ids: torch.Tensor,
@@ -1788,48 +2042,74 @@ class TTModelRunner:
             f"number of requests in input batch {num_reqs}"
         )
         num_out_tokens = sampled_token_ids.shape[1]
-        assert num_out_tokens == 1, "Currently only supporting 1 output token"
 
-        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
-        if sampled_token_ids_np.dtype != np.int32:
-            sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+        # For spec decode, sampled_token_ids may be [num_reqs, K+1] with -1 padding.
+        if num_out_tokens == 1:
+            sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+            if sampled_token_ids_np.dtype != np.int32:
+                sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
+        else:
+            # Multi-token: variable length per request (-1 = padding)
+            sampled_token_ids_np = sampled_token_ids.numpy().astype(np.int32)
 
         # Vectorized update of persistent batch token storage.
         start_idxs = self.input_batch.num_tokens[:num_reqs]
-        end_idxs = start_idxs + 1
-        max_end = int(end_idxs.max()) if num_reqs > 0 else 0
-        assert max_end <= self.model_config.max_model_len, (
-            "Sampled token IDs exceed the max model length. "
-            f"Total number of tokens: {max_end} > max_model_len: "
-            f"{self.model_config.max_model_len}"
-        )
 
-        rows = np.arange(num_reqs)
-        self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
-        self.input_batch.num_tokens[:num_reqs] = end_idxs
+        if num_out_tokens == 1:
+            # Standard single-token path (unchanged)
+            end_idxs = start_idxs + 1
+            max_end = int(end_idxs.max()) if num_reqs > 0 else 0
+            assert max_end <= self.model_config.max_model_len, (
+                "Sampled token IDs exceed the max model length. "
+                f"Total number of tokens: {max_end} > max_model_len: "
+                f"{self.model_config.max_model_len}"
+            )
+            rows = np.arange(num_reqs)
+            self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
+            self.input_batch.num_tokens[:num_reqs] = end_idxs
 
-        # Update request state (output token lists) without dict lookups.
-        # NOTE: `InputBatch.req_output_token_ids[i]` is a direct reference to
-        # the underlying `CachedRequestState.output_token_ids` list (stored in
-        # `self.requests[req_id]`). Appending here updates request state too,
-        # while avoiding a per-request dict lookup.
-        for req_idx in range(num_reqs):
-            output_token_ids = self.input_batch.req_output_token_ids[req_idx]
-            assert output_token_ids is not None
-            output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+            for req_idx in range(num_reqs):
+                output_token_ids = self.input_batch.req_output_token_ids[req_idx]
+                assert output_token_ids is not None
+                output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+        else:
+            # Multi-token spec decode path
+            for req_idx in range(num_reqs):
+                tokens_row = sampled_token_ids_np[req_idx]
+                # Filter -1 padding
+                valid_tokens = tokens_row[tokens_row != -1]
+                n_valid = len(valid_tokens)
+                start = int(start_idxs[req_idx])
+                end = start + n_valid
+                assert end <= self.model_config.max_model_len
+                self.input_batch.token_ids_cpu[req_idx, start:end] = valid_tokens
+                self.input_batch.num_tokens[req_idx] = end
+
+                output_token_ids = self.input_batch.req_output_token_ids[req_idx]
+                assert output_token_ids is not None
+                for tok in valid_tokens:
+                    output_token_ids.append(int(tok))
 
         # Empty prompt log probs
         prompt_logprobs_dict: dict[str, LogprobsTensors | None] = dict.fromkeys(
             self.input_batch.req_ids[:num_reqs], None
         )
 
-        # Note: currently does not support speculative decoding or pooling.
+        if num_out_tokens == 1:
+            per_req_tokens = [
+                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
+            ]
+        else:
+            per_req_tokens = []
+            for i in range(num_reqs):
+                row = sampled_token_ids_np[i]
+                valid = row[row != -1]
+                per_req_tokens.append(valid)
+
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[
-                sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
-            ],
+            sampled_token_ids=per_req_tokens,
             logprobs=logprobs,
             prompt_logprobs_dict=prompt_logprobs_dict,
             pooler_output=[],
