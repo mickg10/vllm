@@ -204,12 +204,11 @@ class OpenAIServingChat(OpenAIServing):
                 and not isinstance(tokenizer, MistralTokenizer)
                 and not self.use_harmony
             ):
-                # for hf tokenizers, "auto" tools requires
-                # --enable-auto-tool-choice and --tool-call-parser
-                return self.create_error_response(
-                    '"auto" tool choice requires '
-                    "--enable-auto-tool-choice and --tool-call-parser to be set"
-                )
+                # No tool parser configured — strip tools from request instead
+                # of returning an error. This lets clients like opencode that
+                # always send tools still get responses (without tool calling).
+                request.tools = None
+                request.tool_choice = "none"
 
             if request.tools is None or (
                 request.tool_choice == "none"
