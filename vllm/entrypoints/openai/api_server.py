@@ -694,7 +694,32 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             headers=metrics_header(metrics_header_format),
         )
 
-    return StreamingResponse(content=generator, media_type="text/event-stream")
+    return StreamingResponse(
+        content=_sse_with_heartbeat(generator),
+        media_type="text/event-stream",
+    )
+
+
+async def _sse_with_heartbeat(generator, interval: float = 15.0):
+    """Wrap an SSE generator with periodic keepalive signals.
+
+    For slow models (e.g., 358B on TT hardware), prefill can take 30+ seconds
+    before the first token. Clients like opencode timeout on idle SSE streams.
+
+    Strategy: yield SSE comments (`: keepalive`) periodically. These are valid
+    per the SSE spec and ignored by compliant clients, but keep the TCP
+    connection alive and signal "still processing" to proxy layers.
+    """
+    import asyncio
+    aiter = generator.__aiter__()
+    while True:
+        try:
+            chunk = await asyncio.wait_for(aiter.__anext__(), timeout=interval)
+            yield chunk
+        except asyncio.TimeoutError:
+            yield ": keepalive\n\n"
+        except StopAsyncIteration:
+            break
 
 
 @router.post(
