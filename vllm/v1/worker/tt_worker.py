@@ -429,6 +429,11 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
         # GLM-4.7-Flash (47B MoE) uses MLA KVPE caching and is DRAM heavy.
         # Tight memory budget especially on T3K (8 devices).
         max_tokens_all_users = 32768
+    elif "GLM-4.7" in model_config.model and not is_wormhole:
+        # GLM-4.7-Full (355B) on BH Galaxy: ~15 GB weights on 32 GB/device.
+        # 160 routed experts (EP=32, 5/device in BF8) + attention (BF16) = DRAM heavy.
+        # 8192 tokens = 128 blocks ≈ 0.9 GB BF16 or 0.45 GB BF8.
+        max_tokens_all_users = 8192
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072
