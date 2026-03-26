@@ -1620,32 +1620,9 @@ class TTModelRunner:
             tt_out, _ = tt_out
 
         # Save full output for draft lane token recovery in batch expansion.
-        # The model returns [num_reqs] tokens (main lanes only). For batch expansion,
-        # we need to also read draft lane outputs. Expand tt_out to include draft slots.
-        if self._spec_decode_lanes and isinstance(tt_out, torch.Tensor):
-            # Read draft lane outputs from the model's trace logits
-            # The trace ran with batch=bucket_size, so logits cover all slots
-            try:
-                draft_tokens = []
-                for lane_idx, (req_idx, draft_token) in enumerate(self._spec_decode_lanes):
-                    draft_slot = num_reqs + lane_idx
-                    # The model's _host_argmax already ran for [active] slots.
-                    # Draft lanes weren't included. For now, use the MTP draft as the
-                    # expected "bonus token" — skip re-reading from trace.
-                    # The verification only checks main_token == draft_token (line 1926).
-                    # The "bonus_token" at draft_slot is what gets appended on acceptance.
-                    # Use 0 as placeholder — will be overwritten by actual model output.
-                    draft_tokens.append(0)
-                if draft_tokens:
-                    # Extend tt_out with placeholder draft slot tokens
-                    draft_out = torch.tensor(draft_tokens, dtype=tt_out.dtype)
-                    self._full_tt_out = torch.cat([tt_out, draft_out])
-                else:
-                    self._full_tt_out = tt_out
-            except Exception:
-                self._full_tt_out = tt_out
-        else:
-            self._full_tt_out = tt_out if self._spec_decode_lanes else None
+        # The model now returns [active*2] tokens when batch_expand is active
+        # (main users + draft lanes). Store the full output for verification.
+        self._full_tt_out = tt_out if self._spec_decode_lanes else None
 
         return self._get_output_tokens(
             tt_out=tt_out,
