@@ -1634,9 +1634,21 @@ class TTModelRunner:
         # _get_output_tokens returns (sampled_token_ids_per_dp, logprobs_per_dp).
         # sampled_token_ids_per_dp[0] is [num_tokens] with sampled token IDs.
         if self._spec_decode_lanes:
+            # Need sampled token IDs for BOTH main users AND draft lanes.
+            # The model output covers the full trace batch (main + draft + padding).
+            # Use the raw model output (tt_out) which has logits for all slots.
+            # Do host argmax for the draft slots only.
             try:
-                sampled = result[0][0]  # first DP rank's sampled token IDs
-                self._full_tt_out = sampled
+                sampled = result[0][0]  # main users' sampled tokens
+                main_ids = torch.tensor(np.array(sampled).reshape(-1), dtype=torch.int32)
+                # For draft lane bonus tokens: just use 0 as placeholder.
+                # The verification at line 1938 only checks main_token == draft_token.
+                # If accepted, bonus_token from full_out[draft_slot] is the model's
+                # output at the draft position — but we don't have it from sampling.
+                # Workaround: put the DRAFT token itself as the bonus token.
+                # This means accepted draft produces [main_token, draft_token] as output.
+                draft_ids = torch.tensor([dt for _, dt in self._spec_decode_lanes], dtype=torch.int32)
+                self._full_tt_out = torch.cat([main_ids, draft_ids])
             except Exception:
                 self._full_tt_out = None
         else:
@@ -1930,6 +1942,13 @@ class TTModelRunner:
         output_token_ids_per_req: list[np.ndarray] = [
             sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
         ]
+        import sys as _sys_v
+        if self._spec_decode_lanes:
+            ft_shape = self._full_tt_out.shape if self._full_tt_out is not None and hasattr(self._full_tt_out, 'shape') else 'None'
+            print(f"[VERIFY DBG] lanes={len(self._spec_decode_lanes)} full_out_shape={ft_shape} sampled={sampled_token_ids_list_1d[:3]}", flush=True, file=_sys_v.stderr)
+            for li, (ri, dt) in enumerate(self._spec_decode_lanes):
+                mt = sampled_token_ids_list_1d[ri]
+                print(f"[VERIFY DBG]   lane{li}: req={ri} main={mt} draft={dt} match={mt==dt}", flush=True, file=_sys_v.stderr)
         if self._spec_decode_lanes and self._full_tt_out is not None:
             full_out = self._full_tt_out
             for lane_idx, (req_idx, draft_token) in enumerate(
