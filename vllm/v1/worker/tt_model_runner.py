@@ -1620,13 +1620,7 @@ class TTModelRunner:
             tt_out, _ = tt_out
 
         # Save full output for draft lane token recovery in batch expansion.
-        # The model returns token IDs for ALL trace batch slots (main + draft).
-        if self._spec_decode_lanes and isinstance(tt_out, torch.Tensor) and tt_out.dim() == 1:
-            self._full_tt_out = tt_out
-        else:
-            self._full_tt_out = None
-
-        return self._get_output_tokens(
+        result = self._get_output_tokens(
             tt_out=tt_out,
             tt_log_probs=tt_log_probs,
             sampling_params=sampling_params,
@@ -1635,6 +1629,20 @@ class TTModelRunner:
             perform_device_sampling=perform_device_sampling,
             is_decode=is_decode,
         )
+
+        # Save sampled token IDs (not raw logits) for batch expansion verification.
+        # _get_output_tokens returns (sampled_token_ids_per_dp, logprobs_per_dp).
+        # sampled_token_ids_per_dp[0] is [num_tokens] with sampled token IDs.
+        if self._spec_decode_lanes:
+            try:
+                sampled = result[0][0]  # first DP rank's sampled token IDs
+                self._full_tt_out = sampled
+            except Exception:
+                self._full_tt_out = None
+        else:
+            self._full_tt_out = None
+
+        return result
 
     def _get_output_tokens(
         self,
