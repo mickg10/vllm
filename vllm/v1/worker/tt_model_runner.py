@@ -857,6 +857,86 @@ class TTModelRunner:
             generators_list=[generators],
         )
 
+    def _process_verify_output(
+        self,
+        tt_out: torch.Tensor,
+        model_input: "TTModelInput",
+        batch_size_per_dp: list[int],
+    ):
+        """Process interleaved verify output: accept/reject drafts, emit multi-token.
+
+        tt_out is logits [2B, 1, vocab] from the interleaved batch.
+        Even indices (0, 2, 4, ...) are main model logits.
+        Odd indices (1, 3, 5, ...) are draft verification logits.
+        """
+        import numpy as np
+        num_reqs = model_input._verify_num_reqs
+        draft_ids_per_req = model_input._verify_draft_token_ids or []
+
+        # Host sampling: argmax all positions
+        if tt_out.dim() == 3:
+            # Logits [2B, 1, vocab] → argmax → [2B]
+            all_tokens = tt_out.squeeze(1).argmax(dim=-1).to(torch.int32)
+        elif tt_out.dim() == 1:
+            all_tokens = tt_out.to(torch.int32)
+        else:
+            all_tokens = tt_out.reshape(-1).to(torch.int32)
+
+        # Build per-request output: accept → [main, bonus], reject → [main]
+        sampled_per_req = []
+        accepted_count = 0
+        total_count = 0
+        for i in range(num_reqs):
+            main_idx = 2 * i
+            draft_idx = 2 * i + 1
+            if main_idx >= all_tokens.shape[0] or draft_idx >= all_tokens.shape[0]:
+                sampled_per_req.append(np.array([0], dtype=np.int32))
+                continue
+
+            main_token = int(all_tokens[main_idx].item())
+            bonus_token = int(all_tokens[draft_idx].item())
+
+            drafts = draft_ids_per_req[i] if i < len(draft_ids_per_req) else []
+            draft_token = drafts[0] if drafts else -1
+            total_count += 1
+
+            if main_token == draft_token:
+                # Accepted: emit both main token + bonus token from draft position
+                sampled_per_req.append(np.array([main_token, bonus_token], dtype=np.int32))
+                accepted_count += 1
+            else:
+                sampled_per_req.append(np.array([main_token], dtype=np.int32))
+
+        if total_count > 0:
+            import sys
+            if not hasattr(self, '_verify_log_count'):
+                self._verify_log_count = 0
+            self._verify_log_count += 1
+            if self._verify_log_count <= 5 or self._verify_log_count % 20 == 0:
+                rate = accepted_count / max(1, total_count) * 100
+                print(f"[VERIFY] #{self._verify_log_count}: {accepted_count}/{total_count} accepted ({rate:.0f}%)",
+                      flush=True, file=sys.stderr)
+
+        # Also harvest MTP drafts for NEXT step
+        if hasattr(self.model, '_last_draft_token_ids') and self.model._last_draft_token_ids is not None:
+            draft_ids = self.model._last_draft_token_ids
+            if isinstance(draft_ids, torch.Tensor):
+                self._draft_token_ids = [[int(x)] for x in draft_ids.tolist()]
+            else:
+                self._draft_token_ids = [[int(x)] for x in list(draft_ids)]
+            self.model._last_draft_token_ids = None
+        else:
+            self._draft_token_ids = None
+
+        # Return as (sampled_token_ids_per_dp, logprobs_per_dp)
+        # sampled_per_req is a list of variable-length numpy arrays
+        # Pad to max length (2 for k=1) for consistent tensor shape
+        max_len = max(len(s) for s in sampled_per_req) if sampled_per_req else 1
+        padded = np.full((num_reqs, max_len), -1, dtype=np.int32)
+        for i, s in enumerate(sampled_per_req):
+            padded[i, :len(s)] = s
+        return ([padded], [None])
+
     def _prepare_verify_inputs(
         self,
         scheduler_output,
@@ -1723,6 +1803,14 @@ class TTModelRunner:
             # Model may return (logits, dummy_logprobs) even when not requested
             tt_out, _ = tt_out
 
+        # WH-style verify: process interleaved 2B output
+        if model_input._verify_mode and isinstance(tt_out, torch.Tensor):
+            return self._process_verify_output(
+                tt_out=tt_out,
+                model_input=model_input,
+                batch_size_per_dp=batch_size_per_dp,
+            )
+
         # Save full output for draft lane token recovery in batch expansion.
         result = self._get_output_tokens(
             tt_out=tt_out,
@@ -2013,15 +2101,30 @@ class TTModelRunner:
             f"number of requests in input batch {num_reqs}"
         )
         num_out_tokens = sampled_token_ids.shape[1]
-        assert num_out_tokens == 1, "Currently only supporting 1 output token"
 
-        sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        if num_out_tokens == 1:
+            sampled_token_ids_np = sampled_token_ids.view(num_reqs).numpy()
+        else:
+            # Multi-token output (spec decode verify accepted some drafts)
+            sampled_token_ids_np = sampled_token_ids[:, 0].numpy()  # first token for batch update
         if sampled_token_ids_np.dtype != np.int32:
             sampled_token_ids_np = sampled_token_ids_np.astype(np.int32, copy=False)
 
         # Vectorized update of persistent batch token storage.
         start_idxs = self.input_batch.num_tokens[:num_reqs]
-        end_idxs = start_idxs + 1
+        # For multi-token: advance by number of valid tokens per request
+        if num_out_tokens > 1:
+            # Count valid tokens per request (non -1 entries)
+            valid_counts = (sampled_token_ids != -1).sum(dim=1).numpy()
+            end_idxs = start_idxs + valid_counts
+            # Store ALL valid tokens in the persistent buffer
+            for i in range(num_reqs):
+                for t in range(int(valid_counts[i])):
+                    tok = int(sampled_token_ids[i, t].item())
+                    if tok >= 0:
+                        self.input_batch.token_ids_cpu[i, start_idxs[i] + t] = tok
+        else:
+            end_idxs = start_idxs + 1
         max_end = int(end_idxs.max()) if num_reqs > 0 else 0
         assert max_end <= self.model_config.max_model_len, (
             "Sampled token IDs exceed the max model length. "
@@ -2030,7 +2133,8 @@ class TTModelRunner:
         )
 
         rows = np.arange(num_reqs)
-        self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
+        if num_out_tokens == 1:
+            self.input_batch.token_ids_cpu[rows, start_idxs] = sampled_token_ids_np
         self.input_batch.num_tokens[:num_reqs] = end_idxs
 
         # Update request state (output token lists) without dict lookups.
@@ -2038,7 +2142,14 @@ class TTModelRunner:
         for req_idx in range(num_reqs):
             output_token_ids = self.input_batch.req_output_token_ids[req_idx]
             assert output_token_ids is not None
-            output_token_ids.append(int(sampled_token_ids_np[req_idx]))
+            if num_out_tokens > 1:
+                # Multi-token: append all valid tokens
+                for t in range(num_out_tokens):
+                    tok = int(sampled_token_ids[req_idx, t].item())
+                    if tok >= 0:
+                        output_token_ids.append(tok)
+            else:
+                output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
         # Batch-expansion verification: compare main lane's sampled token
         # with the draft token that was placed as input to the draft lane.
