@@ -151,6 +151,11 @@ class EngineCore:
                 import os
                 if os.environ.get("GLM4_MOE_MTP", "").strip() == "1":
                     self.use_spec_decode = True
+        import logging as _logging
+        import os as _os_diag
+        _logging.getLogger("vllm").warning("EngineCore: use_spec_decode=%s (speculative_config=%s, MTP_env=%s)",
+            self.use_spec_decode, vllm_config.speculative_config is not None,
+            _os_diag.environ.get("GLM4_MOE_MTP", "not_set"))
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
