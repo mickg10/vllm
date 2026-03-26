@@ -214,6 +214,10 @@ class TTWorker(WorkerBase):
         output = self.model_runner.execute_model(scheduler_output)
         return output
 
+    def take_draft_token_ids(self):
+        """Delegate to model runner for MTP draft tokens."""
+        return self.model_runner.take_draft_token_ids()
+
     def check_health(self) -> None:
         # Worker will always be healthy as long as it's running.
         return
@@ -432,8 +436,8 @@ def get_num_available_blocks_tt(vllm_config: VllmConfig) -> int:
     elif "GLM-4.7" in model_config.model and not is_wormhole:
         # GLM-4.7-Full (355B) on BH Galaxy: ~15 GB weights on 32 GB/device.
         # 160 routed experts (EP=32, 5/device in BF8) + attention (BF16) = DRAM heavy.
-        # 8192 tokens = 128 blocks ≈ 0.9 GB BF16 or 0.45 GB BF8.
-        max_tokens_all_users = 8192
+        # 16384 tokens = 256 blocks ≈ 1.8 GB BF16 or 0.9 GB BF8.
+        max_tokens_all_users = 16384
     else:
         # Note: includes num vision tokens for multi-modal
         max_tokens_all_users = 131072

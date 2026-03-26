@@ -200,6 +200,9 @@ class TTModelRunner:
         # Full model output for draft lane token recovery in batch expansion.
         self._full_tt_out: torch.Tensor | None = None
 
+        # MTP draft token IDs for speculative decode
+        self._draft_token_ids: list[list[int]] | None = None
+
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
         if self.parallel_config.data_parallel_rank_local == 0:
@@ -1365,6 +1368,22 @@ class TTModelRunner:
         return merged
 
     @torch.no_grad()
+    def take_draft_token_ids(self):
+        """Return MTP draft token IDs for speculative decode scheduling.
+
+        Called by tt_worker -> engine core -> scheduler to feed draft tokens
+        back into the scheduling loop for batch-expansion verification.
+        """
+        from vllm.v1.spec_decode import DraftTokenIds
+        if self._draft_token_ids is None:
+            return None
+        # Build req_id -> draft_tokens mapping
+        draft = self._draft_token_ids
+        self._draft_token_ids = None
+        # DraftTokenIds expects list of (req_id, [token_ids])
+        # But we don't have req_ids here — the scheduler maps by position
+        return DraftTokenIds(draft_token_ids=draft)
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1564,6 +1583,17 @@ class TTModelRunner:
                 enable_trace=enable_trace,
                 read_from_device=True,
             )
+
+        # Harvest MTP draft tokens after decode (if model produced them)
+        if is_decode and hasattr(self.model, '_last_draft_token_ids') and self.model._last_draft_token_ids is not None:
+            draft_ids = self.model._last_draft_token_ids
+            if isinstance(draft_ids, torch.Tensor):
+                self._draft_token_ids = [[int(x)] for x in draft_ids.tolist()[:num_reqs]]
+            else:
+                self._draft_token_ids = [[int(x)] for x in list(draft_ids)[:num_reqs]]
+            self.model._last_draft_token_ids = None
+        else:
+            self._draft_token_ids = None
 
         # tt_out can be a tuple of (logits_or_tokens, logprobs) when device
         # sampling is enabled with logprobs. Extract both components.
