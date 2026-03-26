@@ -143,6 +143,14 @@ class EngineCore:
             block_size=scheduler_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        # TT MTP: enable spec decode even without explicit speculative_config
+        # when the TT model produces draft tokens via its built-in MTP layer.
+        if not self.use_spec_decode:
+            from vllm.platforms import current_platform
+            if current_platform and current_platform.device_name == "tt":
+                import os
+                if os.environ.get("GLM4_MOE_MTP", "").strip() == "1":
+                    self.use_spec_decode = True
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
 
