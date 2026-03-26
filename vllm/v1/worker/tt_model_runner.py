@@ -202,6 +202,7 @@ class TTModelRunner:
 
         # MTP draft token IDs for speculative decode
         self._draft_token_ids: list[list[int]] | None = None
+        self._last_req_ids: list[str] | None = None
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -1374,15 +1375,16 @@ class TTModelRunner:
         Called by tt_worker -> engine core -> scheduler to feed draft tokens
         back into the scheduling loop for batch-expansion verification.
         """
-        from vllm.v1.spec_decode import DraftTokenIds
-        if self._draft_token_ids is None:
+        from vllm.v1.outputs import DraftTokenIds
+        if self._draft_token_ids is None or self._last_req_ids is None:
             return None
-        # Build req_id -> draft_tokens mapping
         draft = self._draft_token_ids
+        req_ids = self._last_req_ids
         self._draft_token_ids = None
-        # DraftTokenIds expects list of (req_id, [token_ids])
-        # But we don't have req_ids here — the scheduler maps by position
-        return DraftTokenIds(draft_token_ids=draft)
+        self._last_req_ids = None
+        # Trim to min length in case of mismatch
+        n = min(len(req_ids), len(draft))
+        return DraftTokenIds(req_ids=req_ids[:n], draft_token_ids=draft[:n])
 
     def execute_model(
         self,
@@ -1399,6 +1401,9 @@ class TTModelRunner:
         # Store spec decode tokens for batch expansion in _prepare_model_inputs
         self._scheduled_spec_decode_tokens = (
             scheduler_output.scheduled_spec_decode_tokens)
+
+        # Stash req_ids for MTP draft token output
+        self._last_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
 
         # Update cached state and prepare model inputs
         model_input = self.build_model_input(scheduler_output)
