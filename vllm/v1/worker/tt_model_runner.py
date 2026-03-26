@@ -929,12 +929,11 @@ class TTModelRunner:
             self._draft_token_ids = None
 
         # Return as (sampled_token_ids_per_dp, logprobs_per_dp)
-        # sampled_per_req is a list of variable-length numpy arrays
         # Pad to max length (2 for k=1) for consistent tensor shape
         max_len = max(len(s) for s in sampled_per_req) if sampled_per_req else 1
-        padded = np.full((num_reqs, max_len), -1, dtype=np.int32)
+        padded = torch.full((num_reqs, max_len), -1, dtype=torch.int32)
         for i, s in enumerate(sampled_per_req):
-            padded[i, :len(s)] = s
+            padded[i, :len(s)] = torch.tensor(s, dtype=torch.int32)
         return ([padded], [None])
 
     def _prepare_verify_inputs(
