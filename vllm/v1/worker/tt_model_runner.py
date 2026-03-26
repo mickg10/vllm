@@ -1588,9 +1588,9 @@ class TTModelRunner:
         if is_decode and hasattr(self.model, '_last_draft_token_ids') and self.model._last_draft_token_ids is not None:
             draft_ids = self.model._last_draft_token_ids
             if isinstance(draft_ids, torch.Tensor):
-                self._draft_token_ids = [[int(x)] for x in draft_ids.tolist()[:num_reqs]]
+                self._draft_token_ids = [[int(x)] for x in draft_ids.tolist()]
             else:
-                self._draft_token_ids = [[int(x)] for x in list(draft_ids)[:num_reqs]]
+                self._draft_token_ids = [[int(x)] for x in list(draft_ids)]
             self.model._last_draft_token_ids = None
         else:
             self._draft_token_ids = None
