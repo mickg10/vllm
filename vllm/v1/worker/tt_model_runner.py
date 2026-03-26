@@ -1620,9 +1620,11 @@ class TTModelRunner:
             tt_out, _ = tt_out
 
         # Save full output for draft lane token recovery in batch expansion.
-        # The model now returns [active*2] tokens when batch_expand is active
-        # (main users + draft lanes). Store the full output for verification.
-        self._full_tt_out = tt_out if self._spec_decode_lanes else None
+        # The model returns token IDs for ALL trace batch slots (main + draft).
+        if self._spec_decode_lanes and isinstance(tt_out, torch.Tensor) and tt_out.dim() == 1:
+            self._full_tt_out = tt_out
+        else:
+            self._full_tt_out = None
 
         return self._get_output_tokens(
             tt_out=tt_out,
