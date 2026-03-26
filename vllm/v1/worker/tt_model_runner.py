@@ -613,9 +613,10 @@ class TTModelRunner:
             self._decode_layout_changed_since_last_decode = False
 
             # Check if batch-expansion speculative decoding is enabled
+            # Support both LITE (Flash model) and non-LITE (Full model) env vars
             batch_expand_enabled = (
-                os.environ.get("GLM4_MOE_LITE_BATCH_EXPAND", "").strip()
-                == "1"
+                os.environ.get("GLM4_MOE_LITE_BATCH_EXPAND", "").strip() == "1"
+                or os.environ.get("GLM4_MOE_BATCH_EXPAND", "").strip() == "1"
             )
             self._spec_decode_lanes = []
 
