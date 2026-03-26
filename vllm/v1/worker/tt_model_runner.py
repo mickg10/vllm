@@ -108,6 +108,11 @@ class TTModelInput:
     # [num_main_lanes..2*num_main_lanes-1] are draft verification lanes.
     num_main_lanes: int = 0
 
+    # WH-style model-level interleave verification
+    _verify_mode: bool = False
+    _verify_num_reqs: int = 0
+    _verify_draft_token_ids: list | None = None
+
 
 class TTModelRunner:
     def __init__(
@@ -203,6 +208,12 @@ class TTModelRunner:
         # MTP draft token IDs for speculative decode
         self._draft_token_ids: list[list[int]] | None = None
         self._last_req_ids: list[str] | None = None
+
+        # WH-style model-level interleave spec decode
+        self._tt_spec_decode_enabled = (
+            os.environ.get("GLM4_MOE_MTP", "").strip() == "1"
+            and os.environ.get("GLM4_MOE_BATCH_EXPAND", "").strip() == "1"
+        )
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -571,6 +582,24 @@ class TTModelRunner:
         is_prompt = (len(scheduler_output.scheduled_new_reqs) > 0) or bool(
             cached_reqs.resumed_req_ids
         )
+
+        # WH-style verify dispatch: when scheduler sends spec decode tokens,
+        # build an interleaved 2B batch for verification instead of normal decode.
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
+        is_verify = (
+            not is_prompt
+            and self._tt_spec_decode_enabled
+            and bool(spec_decode_tokens)
+            and num_reqs <= 16  # effective 2B must fit in bucket
+        )
+        if is_verify:
+            return self._prepare_verify_inputs(
+                scheduler_output=scheduler_output,
+                spec_decode_tokens=spec_decode_tokens,
+                block_tables=block_tables,
+                input_batch=input_batch,
+            )
+
         sample_params = input_batch.sampling
         if is_prompt:
             # NOTE: In SchedulerOutput, "cached" means "request data already
@@ -826,6 +855,81 @@ class TTModelRunner:
             max_num_logprobs=[input_batch.max_num_logprobs],
             logitsprocs_list=[input_batch.sampling.logitsprocs],
             generators_list=[generators],
+        )
+
+    def _prepare_verify_inputs(
+        self,
+        scheduler_output,
+        spec_decode_tokens: dict,
+        block_tables: torch.Tensor,
+        input_batch,
+    ) -> "TTModelInput":
+        """Build interleaved 2B batch for WH-style spec decode verification."""
+        num_reqs = input_batch.num_reqs
+        verify_tokens = []
+        verify_positions = []
+        verify_block_tables = []
+
+        for i in range(num_reqs):
+            req_id = input_batch.req_ids[i]
+            main_pos = int(input_batch.num_tokens[i]) - 1
+            main_token = int(input_batch.token_ids_cpu_tensor[i, main_pos].item())
+            draft_ids = spec_decode_tokens.get(req_id, [])
+            draft_token = draft_ids[0] if draft_ids else main_token
+            bt = block_tables[i]
+
+            verify_tokens.append(main_token)
+            verify_positions.append(main_pos)
+            verify_block_tables.append(bt)
+
+            verify_tokens.append(draft_token)
+            verify_positions.append(main_pos + 1)
+            verify_block_tables.append(bt)
+
+        effective_batch = 2 * num_reqs
+        input_tokens = torch.tensor(verify_tokens, dtype=torch.int32).unsqueeze(1)
+        input_positions = torch.tensor(verify_positions, dtype=torch.int32)
+        verify_bt = torch.stack(verify_block_tables)
+
+        # Pad to bucket size
+        max_verify = min(2 * self.scheduler_config.max_num_seqs, 32)
+        if effective_batch < max_verify:
+            pad = max_verify - effective_batch
+            input_tokens = torch.cat([input_tokens, torch.zeros(pad, 1, dtype=torch.int32)])
+            input_positions = torch.cat([input_positions, torch.full((pad,), -1, dtype=torch.int32)])
+            verify_bt = torch.cat([verify_bt, torch.zeros(pad, verify_bt.shape[1], dtype=torch.int32)])
+
+        sample_params = input_batch.sampling
+        return TTModelInput(
+            input_tokens=input_tokens,
+            input_positions=input_positions,
+            prompt_lens=None,
+            block_tables=verify_bt,
+            unpadded_batch_size=effective_batch,
+            tt_sampling_params=TTSamplingParams(
+                temperature=sample_params.temperature,
+                top_k=sample_params.top_k,
+                top_p=sample_params.top_p,
+                presence_penalty=sample_params.presence_penalty,
+                frequency_penalty=sample_params.frequency_penalty,
+                repetition_penalty=sample_params.repetition_penalty,
+                seed=sample_params.seed,
+                enable_log_probs=sample_params.num_logprobs > 0,
+            ),
+            multi_modal_kwargs={},
+            perform_device_sampling=False,
+            grammar_bitmask=[None],
+            logitsprocs_list=[None],
+            bad_words_token_ids_list=[{}],
+            allowed_token_ids_mask_list=[None],
+            generators_list=[{}],
+            max_num_logprobs=[0],
+            _verify_mode=True,
+            _verify_num_reqs=num_reqs,
+            _verify_draft_token_ids=[
+                spec_decode_tokens.get(req_id, [])
+                for req_id in input_batch.req_ids[:num_reqs]
+            ],
         )
 
     def build_model_input(
