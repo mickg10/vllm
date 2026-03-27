@@ -174,6 +174,11 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
+        # TT MTP: k=1 speculative tokens from built-in MTP layer
+        if self.num_spec_tokens == 0:
+            import os
+            if os.environ.get("GLM4_MOE_MTP", "").strip() == "1":
+                self.num_spec_tokens = 1
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(

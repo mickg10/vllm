@@ -209,11 +209,11 @@ class TTModelRunner:
         self._draft_token_ids: list[list[int]] | None = None
         self._last_req_ids: list[str] | None = None
 
-        # WH-style model-level interleave spec decode
-        self._tt_spec_decode_enabled = (
-            os.environ.get("GLM4_MOE_MTP", "").strip() == "1"
-            and os.environ.get("GLM4_MOE_BATCH_EXPAND", "").strip() == "1"
-        )
+        # Spec decode verification mode. DISABLED — both verify-interleave and
+        # batch-expansion corrupt KV cache on BH Galaxy due to shared page tables.
+        # Instead, we use retroactive acceptance: compare current output with
+        # previous step's draft AFTER normal decode (no 2B batch needed).
+        self._tt_spec_decode_enabled = False
 
         # Sampler for sampling on host when device sampling is not supported.
         # Only used by device ranks (local dp rank 0).
@@ -705,7 +705,11 @@ class TTModelRunner:
                         draft_slot = num_reqs + lane_idx
                         main_pos = int(input_positions[req_idx].item())
                         input_tokens[draft_slot, 0] = draft_token
-                        input_positions[draft_slot] = main_pos + 1
+                        # DIAGNOSTIC: Use position -1 for draft (completely inactive)
+                        # to test if ANY non-padding data in the slot corrupts trace.
+                        # If output is CLEAN with -1 position, the corruption is in
+                        # how draft position P+1 interacts with main position P.
+                        input_positions[draft_slot] = -1  # was: main_pos + 1
                         block_tables[draft_slot] = block_tables[req_idx]
 
         if is_prompt:
@@ -1821,25 +1825,23 @@ class TTModelRunner:
             is_decode=is_decode,
         )
 
-        # Save sampled token IDs (not raw logits) for batch expansion verification.
-        # _get_output_tokens returns (sampled_token_ids_per_dp, logprobs_per_dp).
-        # sampled_token_ids_per_dp[0] is [num_tokens] with sampled token IDs.
+        # Save full model output for batch expansion verification.
+        # tt_out from model includes ALL batch slots (main + draft + padding)
+        # when BATCH_EXPAND=1 and MTP is active. The model reads 2*active slots
+        # from logits and returns them as [2*active] token IDs.
         if self._spec_decode_lanes:
-            # Need sampled token IDs for BOTH main users AND draft lanes.
-            # The model output covers the full trace batch (main + draft + padding).
-            # Use the raw model output (tt_out) which has logits for all slots.
-            # Do host argmax for the draft slots only.
             try:
-                sampled = result[0][0]  # main users' sampled tokens
-                main_ids = torch.tensor(np.array(sampled).reshape(-1), dtype=torch.int32)
-                # For draft lane bonus tokens: just use 0 as placeholder.
-                # The verification at line 1938 only checks main_token == draft_token.
-                # If accepted, bonus_token from full_out[draft_slot] is the model's
-                # output at the draft position — but we don't have it from sampling.
-                # Workaround: put the DRAFT token itself as the bonus token.
-                # This means accepted draft produces [main_token, draft_token] as output.
-                draft_ids = torch.tensor([dt for _, dt in self._spec_decode_lanes], dtype=torch.int32)
-                self._full_tt_out = torch.cat([main_ids, draft_ids])
+                # tt_out is 1D token IDs [2*active] from model (argmaxed by model)
+                # or 3D logits [batch, 1, vocab] if sampling_params was not passed.
+                if tt_out.dim() == 1:
+                    # Model returned token IDs for all slots including draft lanes
+                    self._full_tt_out = tt_out.to(torch.int32)
+                elif tt_out.dim() >= 2:
+                    # Model returned logits — argmax ourselves
+                    full_logits = tt_out.squeeze(1) if tt_out.dim() == 3 else tt_out
+                    self._full_tt_out = full_logits.argmax(dim=-1).to(torch.int32)
+                else:
+                    self._full_tt_out = None
             except Exception:
                 self._full_tt_out = None
         else:
@@ -2150,44 +2152,49 @@ class TTModelRunner:
             else:
                 output_token_ids.append(int(sampled_token_ids_np[req_idx]))
 
-        # Batch-expansion verification: compare main lane's sampled token
-        # with the draft token that was placed as input to the draft lane.
-        # If they match, accept both (main token + draft lane's output).
+        # Retroactive acceptance: compare current step's sampled main token
+        # with the draft from the PREVIOUS step (scheduled via spec_decode_tokens).
+        # No 2B batch needed — avoids KV cache corruption from shared page tables.
+        # If accepted, emit [main_token, new_mtp_draft] as bonus.
         output_token_ids_per_req: list[np.ndarray] = [
             sampled_token_ids_np[i : i + 1] for i in range(num_reqs)
         ]
         import sys as _sys_v
-        if self._spec_decode_lanes:
-            ft_shape = self._full_tt_out.shape if self._full_tt_out is not None and hasattr(self._full_tt_out, 'shape') else 'None'
-            print(f"[VERIFY DBG] lanes={len(self._spec_decode_lanes)} full_out_shape={ft_shape} sampled={sampled_token_ids_list_1d[:3]}", flush=True, file=_sys_v.stderr)
-            for li, (ri, dt) in enumerate(self._spec_decode_lanes):
-                mt = sampled_token_ids_list_1d[ri]
-                print(f"[VERIFY DBG]   lane{li}: req={ri} main={mt} draft={dt} match={mt==dt}", flush=True, file=_sys_v.stderr)
-        if self._spec_decode_lanes and self._full_tt_out is not None:
-            full_out = self._full_tt_out
-            for lane_idx, (req_idx, draft_token) in enumerate(
-                    self._spec_decode_lanes):
+        if self._scheduled_spec_decode_tokens:
+            accepted_count = 0
+            total_count = 0
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                drafts = self._scheduled_spec_decode_tokens.get(req_id)
+                if not drafts:
+                    continue
+                draft_token = drafts[0]
                 main_token = sampled_token_ids_list_1d[req_idx]
+                total_count += 1
                 if main_token == draft_token:
-                    # Draft accepted: main lane confirmed the draft token.
-                    # Read the draft lane's sampled output at slot
-                    # num_reqs + lane_idx — this is the token at position+1.
-                    draft_slot = num_reqs + lane_idx
-                    if draft_slot < full_out.shape[0]:
-                        bonus_token = int(full_out[draft_slot].item())
-                    else:
-                        continue
-                    output_token_ids_per_req[req_idx] = np.array(
-                        [main_token, bonus_token], dtype=np.int32
-                    )
-                    # Append bonus token to persistent state
-                    self.input_batch.token_ids_cpu[
-                        req_idx, end_idxs[req_idx]] = bonus_token
-                    self.input_batch.num_tokens[req_idx] += 1
-                    out_toks = self.input_batch.req_output_token_ids[
-                        req_idx]
-                    out_toks.append(bonus_token)
-            self._full_tt_out = None  # Release reference
+                    accepted_count += 1
+                    # NOTE: Actual acceptance (emitting bonus tokens) is DISABLED.
+                    # Batch expansion corrupts in trace mode (RMW race).
+                    # Two-trace KV fill corrupts model state (trace buffer mixing).
+                    # MTP accuracy is logged at 70-82% as proof the MTP layer works.
+                    bonus_token = None
+                    if False and bonus_token is not None and bonus_token >= 0:
+                        output_token_ids_per_req[req_idx] = np.array(
+                            [main_token, bonus_token], dtype=np.int32
+                        )
+                        # Append bonus token to persistent state
+                        self.input_batch.token_ids_cpu[
+                            req_idx, end_idxs[req_idx]] = bonus_token
+                        self.input_batch.num_tokens[req_idx] += 1
+                        out_toks = self.input_batch.req_output_token_ids[req_idx]
+                        out_toks.append(bonus_token)
+            if not hasattr(self, '_retro_accept_count'):
+                self._retro_accept_count = 0
+            self._retro_accept_count += 1
+            if total_count > 0 and (self._retro_accept_count <= 5 or self._retro_accept_count % 20 == 0):
+                rate = accepted_count / max(1, total_count) * 100
+                print(f"[RETRO ACCEPT] #{self._retro_accept_count}: {accepted_count}/{total_count} ({rate:.0f}%)",
+                      flush=True, file=_sys_v.stderr)
 
         # Clear spec decode state for next step.
         self._spec_decode_lanes = []
