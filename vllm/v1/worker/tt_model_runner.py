@@ -2173,12 +2173,11 @@ class TTModelRunner:
                 total_count += 1
                 if main_token == draft_token:
                     accepted_count += 1
-                    # NOTE: Actual acceptance (emitting bonus tokens) is DISABLED.
-                    # Batch expansion corrupts in trace mode (RMW race).
-                    # Two-trace KV fill corrupts model state (trace buffer mixing).
-                    # MTP accuracy is logged at 70-82% as proof the MTP layer works.
+                    # MTP acceptance confirmed. Bonus token emission requires KV fill
+                    # at the accepted position, which needs prefill→decode interleaving
+                    # that's not yet supported in the BH trace pipeline.
                     bonus_token = None
-                    if False and bonus_token is not None and bonus_token >= 0:
+                    if bonus_token is not None and bonus_token >= 0:
                         output_token_ids_per_req[req_idx] = np.array(
                             [main_token, bonus_token], dtype=np.int32
                         )
