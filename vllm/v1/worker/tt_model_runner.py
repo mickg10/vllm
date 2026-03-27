@@ -705,11 +705,7 @@ class TTModelRunner:
                         draft_slot = num_reqs + lane_idx
                         main_pos = int(input_positions[req_idx].item())
                         input_tokens[draft_slot, 0] = draft_token
-                        # DIAGNOSTIC: Use position -1 for draft (completely inactive)
-                        # to test if ANY non-padding data in the slot corrupts trace.
-                        # If output is CLEAN with -1 position, the corruption is in
-                        # how draft position P+1 interacts with main position P.
-                        input_positions[draft_slot] = -1  # was: main_pos + 1
+                        input_positions[draft_slot] = main_pos + 1
                         block_tables[draft_slot] = block_tables[req_idx]
 
         if is_prompt:
@@ -2173,10 +2169,14 @@ class TTModelRunner:
                 total_count += 1
                 if main_token == draft_token:
                     accepted_count += 1
-                    # MTP acceptance confirmed. Bonus token emission requires KV fill
-                    # at the accepted position, which needs prefill→decode interleaving
-                    # that's not yet supported in the BH trace pipeline.
+                    # Draft accepted! With share_cache=True fixing the RMW race,
+                    # the draft slot's KV is correctly filled. The bonus token
+                    # is the model's output at the draft position.
                     bonus_token = None
+                    if self._full_tt_out is not None:
+                        draft_slot = num_reqs + req_idx
+                        if draft_slot < self._full_tt_out.shape[0]:
+                            bonus_token = int(self._full_tt_out[draft_slot].item())
                     if bonus_token is not None and bonus_token >= 0:
                         output_token_ids_per_req[req_idx] = np.array(
                             [main_token, bonus_token], dtype=np.int32
@@ -2194,6 +2194,12 @@ class TTModelRunner:
                 rate = accepted_count / max(1, total_count) * 100
                 print(f"[RETRO ACCEPT] #{self._retro_accept_count}: {accepted_count}/{total_count} ({rate:.0f}%)",
                       flush=True, file=_sys_v.stderr)
+
+        # After acceptance: clear stale drafts.
+        # When accepted (advances by 2), the MTP draft was for P+2 but we need P+3.
+        # Rather than using a stale draft, clear it so the next step runs MTP fresh.
+        if self._scheduled_spec_decode_tokens and accepted_count > 0:
+            self._draft_token_ids = None
 
         # Clear spec decode state for next step.
         self._spec_decode_lanes = []
