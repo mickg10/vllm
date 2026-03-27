@@ -2195,11 +2195,19 @@ class TTModelRunner:
                 print(f"[RETRO ACCEPT] #{self._retro_accept_count}: {accepted_count}/{total_count} ({rate:.0f}%)",
                       flush=True, file=_sys_v.stderr)
 
-        # After acceptance: clear stale drafts.
-        # When accepted (advances by 2), the MTP draft was for P+2 but we need P+3.
-        # Rather than using a stale draft, clear it so the next step runs MTP fresh.
-        if self._scheduled_spec_decode_tokens and accepted_count > 0:
-            self._draft_token_ids = None
+        # After acceptance: swap to draft lane's MTP prediction.
+        # When accepted (advances by 2), the main-lane MTP draft is for P+2
+        # but the next step needs a draft for P+3. The draft lane's MTP predicts P+3.
+        # _draft_token_ids has [[slot0_draft], [slot1_draft]] — swap to slot 1.
+        if self._scheduled_spec_decode_tokens and accepted_count > 0 and self._draft_token_ids:
+            for req_idx in range(num_reqs):
+                req_id = self.input_batch.req_ids[req_idx]
+                drafts_sched = self._scheduled_spec_decode_tokens.get(req_id)
+                if drafts_sched and sampled_token_ids_list_1d[req_idx] == drafts_sched[0]:
+                    # This req was accepted. Use draft lane's MTP output (index num_reqs+req_idx)
+                    draft_lane_idx = num_reqs + req_idx
+                    if draft_lane_idx < len(self._draft_token_ids):
+                        self._draft_token_ids[req_idx] = self._draft_token_ids[draft_lane_idx]
 
         # Clear spec decode state for next step.
         self._spec_decode_lanes = []
