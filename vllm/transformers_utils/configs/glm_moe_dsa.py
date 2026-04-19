@@ -64,7 +64,7 @@ class GlmMoeDsaConfig(PretrainedConfig):
         **kwargs,
     ) -> None:
         if architectures is None:
-            architectures = ["Glm4MoeLiteForCausalLM"]
+            architectures = ["GlmMoeDsaForCausalLM"]
 
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
