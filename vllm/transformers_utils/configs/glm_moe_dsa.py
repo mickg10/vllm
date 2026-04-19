@@ -81,7 +81,11 @@ class GlmMoeDsaConfig(PretrainedConfig):
 
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
+        # DSv3 backend expects rope_scaling with "factor" key
+        if rope_scaling is None:
+            self.rope_scaling = {"type": "default", "factor": 1.0}
+        else:
+            self.rope_scaling = rope_scaling
         self.partial_rotary_factor = partial_rotary_factor
 
         self.q_lora_rank = q_lora_rank
