@@ -163,6 +163,13 @@ def register_tt_models(register_test_models=False) -> None:
         "models.demos.deepseek_v3.tt.generator_vllm:DeepseekV3ForCausalLM",
     )
 
+    # GLM-5.1 (GlmMoeDsaForCausalLM) → reuse DeepSeekV3 backend (same MLA+MoE)
+    _register_model_if_missing(
+        ModelRegistry,
+        "TTGlmMoeDsaForCausalLM",
+        "models.demos.deepseek_v3.tt.generator_vllm:DeepseekV3ForCausalLM",
+    )
+
     # GPT-OSS
     _register_model_if_missing(
         ModelRegistry,

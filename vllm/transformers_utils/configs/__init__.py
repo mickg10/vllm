@@ -28,6 +28,7 @@ from vllm.transformers_utils.configs.hunyuan_vl import (
     HunYuanVLTextConfig,
     HunYuanVLVisionConfig,
 )
+from vllm.transformers_utils.configs.glm_moe_dsa import GlmMoeDsaConfig
 from vllm.transformers_utils.configs.jais import JAISConfig
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.transformers_utils.configs.kimi_vl import KimiVLConfig
@@ -63,6 +64,7 @@ __all__ = [
     "HunYuanVLTextConfig",
     "HunYuanVLVisionConfig",
     "RWConfig",
+    "GlmMoeDsaConfig",
     "JAISConfig",
     "Lfm2MoeConfig",
     "MedusaConfig",
