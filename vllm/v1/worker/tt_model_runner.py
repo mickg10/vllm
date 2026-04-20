@@ -1636,7 +1636,7 @@ class TTModelRunner:
             "tokens": model_input.input_tokens,
             "page_table": model_input.block_tables,
             "kv_cache": self.kv_caches,
-            "enable_trace": self.trace_mode in ["all"],
+            "enable_trace": self.trace_mode in ["all", "decode_only"],
             "prompt_lens": model_input.prompt_lens,
             "start_pos": model_input.input_positions,
         }
