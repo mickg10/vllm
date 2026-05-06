@@ -302,6 +302,14 @@ class SpeculativeConfig:
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]
+        # Skip MTP rewriting when the draft is already a standalone eagle3
+        # model (e.g. Eagle3DeepseekV2ForCausalLM). Otherwise the unconditional
+        # deepseek_v3 -> deepseek_mtp -> DeepSeekMTPModel rewrite corrupts
+        # eagle3 drafts of deepseek-family targets.
+        if initial_architecture.startswith("Eagle3") or initial_architecture.startswith(
+            "Eagle"
+        ):
+            return hf_config
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",

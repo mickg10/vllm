@@ -240,6 +240,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_INDUCTOR_MAX_AUTOTUNE: bool = True
     VLLM_ENABLE_INDUCTOR_COORDINATE_DESCENT_TUNING: bool = True
     VLLM_USE_NCCL_SYMM_MEM: bool = False
+    VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
     VLLM_NCCL_INCLUDE_PATH: str | None = None
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
@@ -1665,6 +1666,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # NCCL header path
     "VLLM_NCCL_INCLUDE_PATH": lambda: os.environ.get("VLLM_NCCL_INCLUDE_PATH", None),
+    # Enable custom allreduce on >2 PCIe-only GPUs (e.g. RTX PRO 6000 Blackwell).
+    # non-P2P PCIe systems cannot use the CUDA IPC path safely.
+    "VLLM_ENABLE_PCIE_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_ENABLE_PCIE_ALLREDUCE", "0"))
+    ),
     # Flag to enable FBGemm kernels on model execution
     "VLLM_USE_FBGEMM": lambda: bool(int(os.getenv("VLLM_USE_FBGEMM", "0"))),
     # GC debug config

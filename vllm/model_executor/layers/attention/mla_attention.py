@@ -741,11 +741,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
-                assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
-                mqa_q = torch.cat(mqa_q, dim=-1)
-                # mqa_q do allgather in head dim.
-                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                # (voipmonitor port) If backend wants FP8 Q, allgather in FP8
+                # (halves bandwidth vs BF16). Else allgather BF16 concat tensor.
+                if fp8_attention and self.impl.supports_quant_query_input:
+                    # mqa_q is already the concat-and-quant FP8 tensor
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+                else:
+                    # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
+                    mqa_q = torch.cat((mqa_ql_nope, mqa_q_pe), dim=-1)
+                    # mqa_q do allgather in head dim.
+                    mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
             if not is_sparse_impl:
@@ -1228,6 +1233,10 @@ class MLACommonPrefillMetadata:
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
         prefill_tokens_with_context: int | None = None
+        # for mla DCP with FP8 KV cache (gather_and_maybe_dequant_cache)
+        # (voipmonitor port)
+        padded_local_token_to_seq: torch.Tensor | None = None
+        padded_local_chunk_total_token: list[int] | None = None
 
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -1785,6 +1794,25 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         dtype=torch.int32,
                     )
 
+                    # (voipmonitor port) padded-local token_to_seq and
+                    # chunk_total_token for gather_and_maybe_dequant_cache
+                    # on the DCP fp8 KV cache path.
+                    padded_local_chunk_total_token = (
+                        padded_local_cu_chunk_seq_lens_cpu[:, -1]
+                    )
+                    padded_local_max_token_num = (
+                        padded_local_chunk_total_token.max().item()
+                    )
+                    padded_local_token_to_seq_cpu = torch.zeros(
+                        [num_chunks, padded_local_max_token_num],
+                        dtype=torch.int32,
+                    )
+                    for _i in range(num_chunks):
+                        _t2s = torch.repeat_interleave(
+                            range_idx, padded_local_chunk_seq_lens[_i]
+                        )
+                        padded_local_token_to_seq_cpu[_i, : _t2s.shape[0]] = _t2s
+
                 prefill_tokens_with_context = None
                 if num_prefills_with_context_cpu > 0:
                     prefill_tokens_with_context = prefill_query_start_loc_cpu[
@@ -1811,6 +1839,14 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
                         chunk_size=padded_local_max_context_chunk_across_ranks,
                         prefill_tokens_with_context=prefill_tokens_with_context,
+                        padded_local_token_to_seq=(
+                            padded_local_token_to_seq_cpu.to(
+                                device, non_blocking=True
+                            )
+                        ),
+                        padded_local_chunk_total_token=(
+                            padded_local_chunk_total_token.tolist()
+                        ),
                     )
                 else:
                     chunked_context_metadata = _ChunkedMetadata(
@@ -2182,7 +2218,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k_scale: torch.Tensor,
         dcp_world_size: int,
     ):
-        assert k_scale is None, "DCP not support scaled kvcache now."
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.prefill_backend is not None
@@ -2197,18 +2232,58 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         iters = len(prefill_metadata.chunked_context.seq_tot)
         workspace = prefill_metadata.chunked_context.workspace
 
+        # (voipmonitor port) FP8 KV cache: gather-and-dequant to BF16 workspace
+        # via gather_and_maybe_dequant_cache instead of blind cp_gather_cache
+        # (which requires matching dtypes).
+        fp8_kv_cache = (
+            isinstance(self.kv_cache_dtype, str)
+            and self.kv_cache_dtype.startswith("fp8")
+            and self.kv_cache_dtype != "fp8_ds_mla"
+        )
+
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            ops.cp_gather_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-            )
+            if fp8_kv_cache:
+                assert k_scale is not None, (
+                    "fp8 DCP prefill gather requires k_scale; check caller"
+                )
+                assert (
+                    prefill_metadata.chunked_context.padded_local_token_to_seq
+                    is not None
+                )
+                assert (
+                    prefill_metadata.chunked_context.padded_local_chunk_total_token
+                    is not None
+                )
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    token_to_seq=prefill_metadata.chunked_context.padded_local_token_to_seq[
+                        i
+                    ],
+                    num_tokens=prefill_metadata.chunked_context.padded_local_chunk_total_token[
+                        i
+                    ],
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                assert k_scale is None, "DCP not support scaled kvcache now."
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    batch_size=attn_metadata.num_prefills,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
             # |<- use for local_gather ->|<--------- use for allgather -------->|
@@ -2329,7 +2404,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
-                        k_scale=None,
+                        k_scale=k_scale,
                         dcp_world_size=self.dcp_world_size,
                     )
                 )
