@@ -2273,7 +2273,10 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     seq_starts=prefill_metadata.chunked_context.starts[i],
                 )
             else:
-                assert k_scale is None, "DCP not support scaled kvcache now."
+                # BF16 KV path: cp_gather_cache is dtype-agnostic and ignores scale.
+                # Original upstream code had `assert k_scale is None` here, but
+                # layer._k_scale is always populated (as 1.0 identity when no
+                # quant) so that assert fires on BF16 too. Drop it.
                 ops.cp_gather_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
