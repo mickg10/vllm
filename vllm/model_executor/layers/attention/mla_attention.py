@@ -1437,7 +1437,15 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             # which would result in up-projected context being
             #   2*(192*128)*(64*1024) = 3gb
             # (assuming 192 QK head dim, 128 heads, and fp16)
-            64 * 1024,
+            # Raised from 64*1024 to 256*1024. The 64K cap forces multi-chunk
+            # in _context_parallel_compute_prefill_context for prompts >64K
+            # with DCP, which has an unidentified regression that corrupts
+            # attention scores at chunk boundaries and degenerates output
+            # into token loops. 256K keeps prompts up to 256K tokens in the
+            # known-good single-chunk path. Cost: ~576MB extra per-rank
+            # workspace (was 144MB at 64K). Kimi-K2.6 max context = 262K so
+            # this covers ~97% of possible contexts.
+            256 * 1024,
         )
 
         # Enforce that we enough for at least 1 page per request
