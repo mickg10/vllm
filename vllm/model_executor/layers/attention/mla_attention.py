@@ -2251,6 +2251,25 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
+            # Instrumentation: multi-chunk diagnostic. Enable by setting
+            # VLLM_KIMI26_MLA_TRACE=1 in the container env. Dumps per-iter
+            # numeric stats of inputs/outputs to stderr for offline diffing
+            # against a known-good run (e.g. voip container) to locate the
+            # first iteration where state diverges.
+            import os as _os_trace
+            _trace = _os_trace.environ.get("VLLM_KIMI26_MLA_TRACE") == "1"
+            if _trace:
+                import sys as _sys_trace
+                _layer_name = getattr(self, "layer_name", "?")
+                _sys_trace.stderr.write(
+                    f"[mla-trace L={_layer_name} iter={i}/{iters}] "
+                    f"toks={toks} "
+                    f"workspace.shape={tuple(workspace.shape)} "
+                    f"workspace.dtype={workspace.dtype} "
+                    f"fp8={fp8_kv_cache} "
+                    f"kv_cache_dtype={self.kv_cache_dtype}\n"
+                )
+
             if fp8_kv_cache:
                 assert k_scale is not None, (
                     "fp8 DCP prefill gather requires k_scale; check caller"
@@ -2302,6 +2321,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             assert allgather_offset * (dcp_world_size + 1) == workspace.shape[0]
             assert toks <= allgather_offset
             local_gathered_kvcache = workspace[:toks]
+            if _trace:
+                _gw = workspace[:toks].float()
+                _sys_trace.stderr.write(
+                    f"[mla-trace L={_layer_name} iter={i}] "
+                    f"post-gather local_gathered[:toks={toks}] "
+                    f"norm={_gw.norm().item():.6g} "
+                    f"absmax={_gw.abs().max().item():.6g} "
+                    f"nan={_gw.isnan().any().item()} "
+                    f"inf={_gw.isinf().any().item()} "
+                    f"first3={_gw.flatten()[:3].tolist()}\n"
+                )
             cur_allgather_workspace = workspace[
                 allgather_offset : allgather_offset * (1 + dcp_world_size)
             ]
@@ -2310,6 +2340,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
             cur_allgather_kvcache.copy_(
                 get_dcp_group().all_gather(local_gathered_kvcache, dim=0)
             )
+            if _trace:
+                _aw = cur_allgather_kvcache.float()
+                _sys_trace.stderr.write(
+                    f"[mla-trace L={_layer_name} iter={i}] "
+                    f"post-allgather shape={tuple(cur_allgather_kvcache.shape)} "
+                    f"norm={_aw.norm().item():.6g} "
+                    f"absmax={_aw.abs().max().item():.6g} "
+                    f"nan={_aw.isnan().any().item()}\n"
+                )
             assert (
                 cur_allgather_kvcache.shape[-1]
                 == self.kv_lora_rank + self.qk_rope_head_dim
@@ -2346,6 +2385,22 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     v=v,
                 )
             )
+            if _trace:
+                _ao = attn_output.float()
+                _lse = attn_softmax_lse.float()
+                _sys_trace.stderr.write(
+                    f"[mla-trace L={_layer_name} iter={i}] "
+                    f"post-reorg kv_c_normed.shape={tuple(kv_c_normed.shape)} "
+                    f"kv_c.norm={kv_c_normed.float().norm().item():.6g} "
+                    f"k_pe.norm={k_pe.float().norm().item():.6g} "
+                    f"post-attn out.shape={tuple(attn_output.shape)} "
+                    f"out.norm={_ao.norm().item():.6g} "
+                    f"out.absmax={_ao.abs().max().item():.6g} "
+                    f"lse.min={_lse.min().item():.6g} "
+                    f"lse.max={_lse.max().item():.6g} "
+                    f"q.norm={q.float().norm().item():.6g} "
+                    f"k.norm={k.float().norm().item():.6g}\n"
+                )
 
             if output is None:
                 output = attn_output
